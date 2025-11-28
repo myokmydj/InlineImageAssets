@@ -1,0 +1,12 @@
+{
+    "name": "Inline Image Assets",
+    "display_name": "Inline Image Assets",
+    "description": "Allows managing and displaying images directly within chat messages using a special tag.",
+    "author": "User-inspired",
+    "version": "1.0.0",
+    "loading_order": 20,
+    "js": "index.js",
+    "css": "style.css",
+    "requires": [],
+    "optional": []
+}
