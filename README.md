@@ -10,4 +10,6 @@ The bot will output it as `%%img:filename%%`, and the extension will convert tha
 
 
 Like this:
+<br>
+<br>
 <img width="743" height="486" alt="image" src="https://github.com/user-attachments/assets/89a54272-f515-48ec-95d0-c8896b9c4dc7" />
