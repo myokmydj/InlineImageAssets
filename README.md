@@ -213,7 +213,6 @@ This is usually a CSRF token issue:
 - 🔄 Legacy base64 migration tool
 
 ### Version 4.x
-- Added charx asset import
 - Improved tag filtering
 - Performance optimizations
 
