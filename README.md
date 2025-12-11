@@ -2,9 +2,6 @@
 
 A powerful SillyTavern extension for managing and displaying inline image assets in chat messages. Features ultra-fast local file uploads, batch processing, and performance optimizations for smooth scrolling even with thousands of messages.
 
-<img width="1505" height="1015" alt="SillyTavern-12-08-2025_05_08_PM" src="https://github.com/user-attachments/assets/6cd266fc-4962-4f9c-95a5-f17676bf7244" />
-
-
 ---
 
 ## 🌟 Overview
@@ -13,6 +10,7 @@ A powerful SillyTavern extension for managing and displaying inline image assets
 
 - Display character expressions and poses inline within chat messages
 - Manage thousands of assets without lag or memory issues
+- Seamless integration with charx character format
 - AI-friendly asset prompts for automatic image insertion
 
 ---
@@ -96,7 +94,7 @@ The tag will be automatically replaced with the corresponding image.
 ### Generating AI Prompts
 
 1. Click the **📄 Copy Asset List** button
-2. Paste the generated prompt into your character's world info (It is good works in AN↓)
+2. Paste the generated prompt into your character's description or system prompt
 3. The AI will know which images are available and how to use them
 
 **Generated Prompt Example:**
@@ -213,6 +211,7 @@ This is usually a CSRF token issue:
 - 🔄 Legacy base64 migration tool
 
 ### Version 4.x
+- Added charx asset import
 - Improved tag filtering
 - Performance optimizations
 

@@ -140,6 +140,11 @@ import { eventSource, event_types } from "../../../../script.js";
     let cachedCharacterId = null;
     let cachedCharacterName = null;
     
+    // Persona asset cache (separate from character)
+    let personaAssetCache = new Map();
+    let cachedPersonaName = null;
+    const PERSONA_PREFIX = 'inline_assets__persona__';
+    
     // Thumbnail cache for popup performance
     let thumbnailCache = new Map();
     
@@ -241,6 +246,17 @@ import { eventSource, event_types } from "../../../../script.js";
     }
 
     /**
+     * Gets the filename prefix for a persona's assets
+     * Uses flat structure: inline_assets__persona__PersonaName__
+     * @param {string} personaName - Persona name
+     * @returns {string} - Filename prefix
+     */
+    function getPersonaFilePrefix(personaName) {
+        const sanitizedName = sanitizePathSegment(personaName);
+        return `${PERSONA_PREFIX}${sanitizedName}${PATH_SEPARATOR}`;
+    }
+
+    /**
      * Gets the full filename for an asset (flat structure, no slashes)
      * @param {string} characterName - Character name
      * @param {string} assetFilename - Asset filename
@@ -250,6 +266,38 @@ import { eventSource, event_types } from "../../../../script.js";
         const prefix = getCharacterFilePrefix(characterName);
         const sanitizedFilename = sanitizePathSegment(assetFilename);
         return `${prefix}${sanitizedFilename}`;
+    }
+
+    /**
+     * Gets the full filename for a persona asset (flat structure, no slashes)
+     * @param {string} personaName - Persona name
+     * @param {string} assetFilename - Asset filename
+     * @returns {string} - Full flat filename
+     */
+    function getPersonaAssetFullFilename(personaName, assetFilename) {
+        const prefix = getPersonaFilePrefix(personaName);
+        const sanitizedFilename = sanitizePathSegment(assetFilename);
+        return `${prefix}${sanitizedFilename}`;
+    }
+
+    /**
+     * Extracts the original asset name from a persona filename
+     * @param {string} fullFilename - Full filename with prefix
+     * @param {string} personaName - Persona name
+     * @returns {string} - Original asset name without extension
+     */
+    function extractPersonaAssetName(fullFilename, personaName) {
+        const prefix = getPersonaFilePrefix(personaName);
+        let name = fullFilename;
+        if (name.startsWith(prefix)) {
+            name = name.substring(prefix.length);
+        }
+        // Remove extension
+        const lastDot = name.lastIndexOf('.');
+        if (lastDot > 0) {
+            name = name.substring(0, lastDot);
+        }
+        return name;
     }
 
     /**
@@ -486,6 +534,80 @@ import { eventSource, event_types } from "../../../../script.js";
     }
 
     /**
+     * Lists all image files for a persona
+     * Uses flat structure in user/files/ (inline_assets__persona__PersonaName__filename.png)
+     * @param {string} personaName - Persona name
+     * @returns {Promise<Array>} - Array of file info objects
+     */
+    async function listPersonaImages(personaName) {
+        const allAssets = [];
+        const seenNames = new Set();
+        
+        try {
+            const prefix = getPersonaFilePrefix(personaName);
+            const sanitizedName = sanitizePathSegment(personaName);
+            log(`Listing images for persona "${personaName}" (sanitized: "${sanitizedName}") with prefix "${prefix}"`);
+            
+            // Flat structure in user/files/
+            let flatFiles = [];
+            const flatPathsToTry = ['', '/'];
+            
+            for (const path of flatPathsToTry) {
+                try {
+                    const apiUrl = `/api/files/list?path=${encodeURIComponent(path)}`;
+                    log(`Trying flat API for persona: ${apiUrl}`);
+                    const response = await fetch(apiUrl);
+                    if (response.ok) {
+                        const result = await response.json();
+                        if (Array.isArray(result) && result.length > 0) {
+                            flatFiles = result;
+                            log(`Flat file list found for persona, count: ${flatFiles.length}`);
+                            break;
+                        }
+                    }
+                } catch (e) {
+                    log(`Error fetching flat path for persona "${path}":`, e.message);
+                }
+            }
+            
+            // Filter and add flat structure files
+            if (flatFiles.length > 0) {
+                const filtered = flatFiles.filter(file => {
+                    const fileName = file.name || file;
+                    if (typeof fileName !== 'string') return false;
+                    if (!fileName.startsWith(prefix)) return false;
+                    const ext = fileName.split('.').pop()?.toLowerCase();
+                    return SUPPORTED_FORMATS.includes(ext);
+                });
+                
+                log(`Filtered ${filtered.length} flat files for persona ${personaName}`);
+                
+                filtered.forEach(file => {
+                    const fileName = file.name || file;
+                    const assetName = extractPersonaAssetName(fileName, personaName);
+                    if (!seenNames.has(assetName)) {
+                        seenNames.add(assetName);
+                        allAssets.push({
+                            name: assetName,
+                            filename: fileName,
+                            path: fileName,
+                            url: `/user/files/${fileName}`,
+                            size: file.size,
+                            modified: file.modified
+                        });
+                    }
+                });
+            }
+            
+            log(`Total persona assets found: ${allAssets.length}`);
+            return allAssets;
+        } catch (error) {
+            console.error('[InlineImageAssets] Failed to list persona images:', error);
+            return [];
+        }
+    }
+
+    /**
      * Gets asset metadata from character extension field (fallback)
      * @param {string} characterName - Character name
      * @returns {Promise<Array>} - Array of asset info
@@ -661,6 +783,164 @@ import { eventSource, event_types } from "../../../../script.js";
         } catch (error) {
             console.error('[InlineImageAssets] Failed to save image:', error);
             throw error;
+        }
+    }
+
+    /**
+     * Saves an image file for a persona (flat structure, no slashes)
+     * @param {string} personaName - Persona name
+     * @param {string} filename - Filename to save as
+     * @param {Blob|File} imageData - Image data
+     * @returns {Promise<Object>} - Saved file info
+     */
+    async function savePersonaImageFile(personaName, filename, imageData) {
+        try {
+            // Sanitize the filename first
+            const sanitizedFilename = sanitizePathSegment(filename);
+            
+            // Check if filename already has our prefix to avoid double-prefixing
+            const prefix = getPersonaFilePrefix(personaName);
+            let fullFilename;
+            if (sanitizedFilename.startsWith(PERSONA_PREFIX)) {
+                // Already has prefix, use as-is
+                fullFilename = sanitizedFilename;
+                log('Persona filename already has prefix, using as-is:', fullFilename);
+            } else {
+                // Add prefix
+                fullFilename = getPersonaAssetFullFilename(personaName, sanitizedFilename);
+                log('Added prefix to persona filename:', fullFilename);
+            }
+            
+            // Convert blob to base64
+            const base64Data = await blobToBase64(imageData);
+            
+            console.log('[InlineImageAssets] Uploading persona asset:', fullFilename);
+            log('Blob type:', imageData.type, 'size:', imageData.size);
+            
+            // Get headers with CSRF token (async)
+            const headers = await getApiHeaders();
+            
+            const response = await fetch('/api/files/upload', {
+                method: 'POST',
+                headers: headers,
+                body: JSON.stringify({
+                    name: fullFilename,
+                    data: base64Data
+                })
+            });
+            
+            if (!response.ok) {
+                const errorText = await response.text();
+                console.error('[InlineImageAssets] Persona upload response:', response.status, errorText);
+                
+                // If forbidden, try to refresh CSRF token and retry once
+                if (response.status === 403) {
+                    console.log('[InlineImageAssets] Got 403, refreshing CSRF token and retrying...');
+                    invalidateCsrfToken();
+                    csrfDisabled = false;
+                    const newHeaders = await getApiHeaders();
+                    
+                    const retryResponse = await fetch('/api/files/upload', {
+                        method: 'POST',
+                        headers: newHeaders,
+                        body: JSON.stringify({
+                            name: fullFilename,
+                            data: base64Data
+                        })
+                    });
+                    
+                    if (!retryResponse.ok) {
+                        const retryErrorText = await retryResponse.text();
+                        throw new Error(`Upload failed after retry: ${retryResponse.status} ${retryErrorText}`);
+                    }
+                    
+                    const displayName = extractPersonaAssetName(fullFilename, personaName);
+                    const fileUrl = `/user/files/${fullFilename}`;
+                    
+                    return {
+                        name: displayName,
+                        filename: fullFilename,
+                        path: fullFilename,
+                        url: fileUrl
+                    };
+                }
+                
+                throw new Error(`Upload failed: ${response.status} ${errorText}`);
+            }
+            
+            const result = await response.json();
+            console.log('[InlineImageAssets] Persona upload result:', result);
+            
+            const displayName = extractPersonaAssetName(fullFilename, personaName);
+            const fileUrl = `/user/files/${fullFilename}`;
+            
+            return {
+                name: displayName,
+                filename: fullFilename,
+                path: fullFilename,
+                url: fileUrl
+            };
+        } catch (error) {
+            console.error('[InlineImageAssets] Failed to save persona image:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Deletes a persona image file (flat structure)
+     * @param {string} personaName - Persona name
+     * @param {string} filename - Full filename (with prefix) to delete
+     * @returns {Promise<boolean>} - Success status
+     */
+    async function deletePersonaImageFile(personaName, filename) {
+        try {
+            const prefix = getPersonaFilePrefix(personaName);
+            const fullFilename = filename.startsWith(prefix) ? filename : getPersonaAssetFullFilename(personaName, filename);
+            
+            log('Deleting persona file:', fullFilename);
+            
+            const headers = await getApiHeaders();
+            
+            const pathsToTry = [
+                fullFilename,
+                `files/${fullFilename}`,
+                `/files/${fullFilename}`,
+            ];
+            
+            for (const deletePath of pathsToTry) {
+                const response = await fetch('/api/files/delete', {
+                    method: 'POST',
+                    headers: headers,
+                    body: JSON.stringify({ path: deletePath })
+                });
+                
+                if (response.ok) {
+                    log('Persona delete successful with path:', deletePath);
+                    return true;
+                }
+                
+                if (response.status === 403) {
+                    invalidateCsrfToken();
+                    csrfDisabled = false;
+                    const newHeaders = await getApiHeaders();
+                    
+                    const retryResponse = await fetch('/api/files/delete', {
+                        method: 'POST',
+                        headers: newHeaders,
+                        body: JSON.stringify({ path: deletePath })
+                    });
+                    
+                    if (retryResponse.ok) {
+                        return true;
+                    }
+                }
+            }
+            
+            console.warn('[InlineImageAssets] Persona delete failed with all path formats');
+            return false;
+        } catch (error) {
+            console.error('[InlineImageAssets] Failed to delete persona image:', error);
+            return false;
         }
     }
 
@@ -1684,6 +1964,160 @@ import { eventSource, event_types } from "../../../../script.js";
         log('Asset cache invalidated');
     }
 
+    function invalidatePersonaAssetCache() {
+        personaAssetCache.clear();
+        cachedPersonaName = null;
+        log('Persona asset cache invalidated');
+    }
+
+    /**
+     * Gets current persona name from context
+     * @returns {string|null} - Current persona name or null
+     */
+    function getCurrentPersonaName() {
+        const context = getContext();
+        // SillyTavern stores persona info in name1 or user_avatar
+        return context.name1 || null;
+    }
+
+    /**
+     * Gets persona assets from extension settings
+     * @param {string} personaName - Persona name
+     * @returns {Array} - Array of asset info
+     */
+    function getPersonaAssetsRaw(personaName) {
+        if (!personaName) return [];
+        
+        const context = getContext();
+        // Store persona assets in extension settings
+        const extensionSettings = context.extensionSettings || {};
+        const inlineAssetsSettings = extensionSettings.inlineImageAssets || {};
+        const personaAssets = inlineAssetsSettings.personas || {};
+        
+        const assets = personaAssets[personaName] || [];
+        log(`getPersonaAssetsRaw: Found ${assets.length} assets for persona "${personaName}"`);
+        return assets;
+    }
+
+    /**
+     * Saves persona assets to extension settings
+     * @param {string} personaName - Persona name
+     * @param {Array} assets - Array of asset metadata
+     */
+    async function savePersonaAssets(personaName, assets) {
+        if (!personaName) return;
+        
+        const context = getContext();
+        // Initialize settings structure if needed
+        if (!context.extensionSettings.inlineImageAssets) {
+            context.extensionSettings.inlineImageAssets = {};
+        }
+        if (!context.extensionSettings.inlineImageAssets.personas) {
+            context.extensionSettings.inlineImageAssets.personas = {};
+        }
+        
+        context.extensionSettings.inlineImageAssets.personas[personaName] = assets;
+        
+        // Save settings
+        context.saveSettingsDebounced();
+        
+        // Invalidate cache
+        invalidatePersonaAssetCache();
+        log(`Saved ${assets.length} assets for persona "${personaName}"`);
+    }
+
+    /**
+     * Builds persona asset cache
+     * @param {string} personaName - Persona name
+     * @returns {Promise<Map>} - Asset cache map
+     */
+    async function buildPersonaAssetCache(personaName) {
+        if (!personaName) return new Map();
+        
+        // Return existing cache if valid
+        if (cachedPersonaName === personaName && personaAssetCache.size > 0) {
+            return personaAssetCache;
+        }
+        
+        personaAssetCache.clear();
+        const assets = getPersonaAssetsRaw(personaName);
+        
+        log(`Building persona asset cache for ${personaName}, ${assets.length} assets from settings`);
+        
+        // Also try to get file list from file system
+        let fileSystemAssets = [];
+        try {
+            fileSystemAssets = await listPersonaImages(personaName);
+            log(`Found ${fileSystemAssets.length} persona files in file system (user/files/)`);
+        } catch (e) {
+            log('Could not list persona file system assets:', e.message);
+        }
+        
+        // Create a map of filename -> URL from file system
+        const fileUrlMap = new Map();
+        fileSystemAssets.forEach(fa => {
+            if (fa.filename && fa.url) {
+                fileUrlMap.set(fa.filename, fa.url);
+                fileUrlMap.set(fa.name, fa.url);
+                const sanitizedName = sanitizeFilename(fa.name);
+                if (sanitizedName !== fa.name) {
+                    fileUrlMap.set(sanitizedName, fa.url);
+                }
+                fileUrlMap.set(fa.name.toLowerCase(), fa.url);
+            }
+        });
+        
+        for (const asset of assets) {
+            if (asset.name) {
+                let url = asset.url;
+                
+                if (!url && asset.filename) {
+                    url = `/user/files/${asset.filename}`;
+                } else if (!url && fileUrlMap.has(asset.name)) {
+                    url = fileUrlMap.get(asset.name);
+                }
+                
+                if (url) {
+                    personaAssetCache.set(asset.name, url);
+                    log(`Cached persona asset: ${asset.name} -> ${url}`);
+                    
+                    const sanitizedName = sanitizeFilename(asset.name);
+                    if (sanitizedName !== asset.name && !personaAssetCache.has(sanitizedName)) {
+                        personaAssetCache.set(sanitizedName, url);
+                    }
+                    
+                    const lowerName = asset.name.toLowerCase();
+                    if (!personaAssetCache.has(lowerName)) {
+                        personaAssetCache.set(lowerName, url);
+                    }
+                }
+            }
+        }
+        
+        // Also add any file system assets not in settings
+        fileSystemAssets.forEach(fa => {
+            if (fa.name && !personaAssetCache.has(fa.name) && fa.url) {
+                personaAssetCache.set(fa.name, fa.url);
+                log(`Added persona file system asset to cache: ${fa.name} -> ${fa.url}`);
+                
+                const sanitizedName = sanitizeFilename(fa.name);
+                if (sanitizedName !== fa.name && !personaAssetCache.has(sanitizedName)) {
+                    personaAssetCache.set(sanitizedName, fa.url);
+                }
+                
+                const lowerName = fa.name.toLowerCase();
+                if (!personaAssetCache.has(lowerName)) {
+                    personaAssetCache.set(lowerName, fa.url);
+                }
+            }
+        });
+        
+        cachedPersonaName = personaName;
+        
+        log(`Persona asset cache built: ${personaAssetCache.size} items for persona ${personaName}`);
+        return personaAssetCache;
+    }
+
     /**
      * Check if current character has any assets.
      * This is the KEY function for asset rendering mode.
@@ -2326,7 +2760,15 @@ import { eventSource, event_types } from "../../../../script.js";
         
         // Build/get asset cache once for the batch
         const cache = await buildAssetCache(character, context);
-        if (cache.size === 0) {
+        
+        // Build persona cache as well (for fallback)
+        const personaName = getCurrentPersonaName();
+        let pCache = new Map();
+        if (personaName) {
+            pCache = await buildPersonaAssetCache(personaName);
+        }
+        
+        if (cache.size === 0 && pCache.size === 0) {
             // No assets - clear queue and deactivate
             renderQueue = [];
             isAssetRenderingActive = false;
@@ -2345,7 +2787,7 @@ import { eventSource, event_types } from "../../../../script.js";
             
             const messageElement = renderQueue.shift();
             if (messageElement) {
-                renderMessageFast(messageElement, context, character, cache);
+                renderMessageFast(messageElement, context, character, cache, pCache);
                 processed++;
             }
         }
@@ -2358,7 +2800,8 @@ import { eventSource, event_types } from "../../../../script.js";
     }
 
     // Ultra-fast render function using cached data
-    function renderMessageFast(messageElement, context, character, cache) {
+    // Now supports both character cache (priority) and persona cache (fallback)
+    function renderMessageFast(messageElement, context, character, cache, personaCache = new Map()) {
         // Skip if being processed (prevent concurrent processing)
         if (messageElement.dataset.rendering) {
             return;
@@ -2416,29 +2859,52 @@ import { eventSource, event_types } from "../../../../script.js";
         let modified = false;
 
         // Use cached Map for O(1) lookups instead of O(n) array.find()
+        // Priority: character cache first, then persona cache as fallback
         const finalHtml = html.replace(tagRegex, (match, assetName) => {
             const trimmedName = assetName.trim();
             
-            // Try exact match first
+            // Try exact match first (character cache)
             let assetSource = cache.get(trimmedName);
+            
+            // If not found in character cache, try persona cache
+            if (!assetSource && personaCache.size > 0) {
+                assetSource = personaCache.get(trimmedName);
+                if (assetSource) {
+                    log(`Found asset in persona cache: "${trimmedName}"`);
+                }
+            }
             
             // If not found, try sanitized version (handles spaces -> underscores, etc.)
             if (!assetSource) {
                 const sanitizedName = sanitizeFilename(trimmedName);
                 assetSource = cache.get(sanitizedName);
+                if (!assetSource && personaCache.size > 0) {
+                    assetSource = personaCache.get(sanitizedName);
+                }
                 if (assetSource) {
                     log(`Found asset via sanitized name: "${trimmedName}" -> "${sanitizedName}"`);
                 }
             }
             
-            // If still not found, try case-insensitive search
+            // If still not found, try case-insensitive search (both caches)
             if (!assetSource) {
                 const lowerName = trimmedName.toLowerCase();
+                // Try character cache first
                 for (const [key, value] of cache.entries()) {
                     if (key.toLowerCase() === lowerName) {
                         assetSource = value;
                         log(`Found asset via case-insensitive match: "${trimmedName}" -> "${key}"`);
                         break;
+                    }
+                }
+                // If not found, try persona cache
+                if (!assetSource && personaCache.size > 0) {
+                    for (const [key, value] of personaCache.entries()) {
+                        if (key.toLowerCase() === lowerName) {
+                            assetSource = value;
+                            log(`Found asset in persona cache via case-insensitive match: "${trimmedName}" -> "${key}"`);
+                            break;
+                        }
                     }
                 }
             }
@@ -3732,6 +4198,801 @@ If there are variations in numbers, do not use them consecutively.`;
             }
         }
     }
+
+    // === PERSONA ASSET MANAGER ===
+    
+    // Globals for Persona Popup
+    let currentPersonaPopupAssets = [];
+    let personaSelectedAssets = new Set();
+    let isPersonaSelectionMode = false;
+
+    function createPersonaAssetManagerButton() {
+        const button = document.createElement('div');
+        button.className = 'menu_button menu_button_icon inline-assets-persona-button';
+        button.title = 'Manage Persona Inline Image Assets';
+        button.innerHTML = '<i class="fa-solid fa-images"></i>';
+        button.addEventListener('click', async () => {
+            const popupContent = await createPersonaAssetManagerPopup();
+            if (popupContent) getContext().callPopup(popupContent, 'text', '', { wide: true, large: true });
+        });
+        return button;
+    }
+
+    function injectPersonaButton() {
+        if (document.querySelector('.inline-assets-persona-button')) return;
+        
+        // Try to find persona controls
+        const personaControls = document.querySelector('#persona_controls .persona_controls_buttons_block');
+        if (personaControls) {
+            const button = createPersonaAssetManagerButton();
+            // Insert after persona_lore_button if exists
+            const loreButton = personaControls.querySelector('#persona_lore_button');
+            if (loreButton) {
+                loreButton.parentNode.insertBefore(button, loreButton.nextSibling);
+            } else {
+                personaControls.appendChild(button);
+            }
+            log('Persona asset button injected');
+        }
+    }
+
+    async function createPersonaAssetManagerPopup() {
+        const personaName = getCurrentPersonaName();
+        if (!personaName) {
+            toastr.error("No persona selected.");
+            return null;
+        }
+
+        const container = document.createElement('div');
+        container.className = 'inline-assets-popup-container persona-assets-popup';
+
+        container.innerHTML = `
+            <div class="inline-assets-header">
+                <h3>Image Assets for Persona: ${personaName}</h3>
+                <div class="inline-assets-header-actions">
+                    <div id="persona-refresh-assets-btn" class="menu_button menu_button_icon" title="Refresh Assets">
+                        <i class="fa-solid fa-sync"></i>
+                    </div>
+                    <div id="persona-generate-prompt-btn" class="menu_button menu_button_icon" title="Copy Asset List Prompt for Lorebook">
+                        <i class="fa-solid fa-file-invoice"></i>
+                    </div>
+                    <div id="persona-download-zip-btn" class="menu_button menu_button_icon" title="Download All as ZIP">
+                        <i class="fa-solid fa-file-zipper"></i>
+                    </div>
+                    <label class="menu_button menu_button_icon">
+                        <i class="fa-solid fa-upload"></i>
+                        <span>Upload</span>
+                        <input type="file" id="persona-asset-upload-input" multiple accept="image/*,image/webp" style="display: none;">
+                    </label>
+                </div>
+            </div>
+            <div class="inline-assets-toolbar">
+                <div class="inline-assets-toolbar-left">
+                    <i class="fa-solid fa-tags"></i>
+                    <div id="persona-inline-assets-tag-filter-container"></div>
+                </div>
+                <div class="inline-assets-toolbar-right">
+                    <div id="persona-toggle-selection-btn" class="menu_button menu_button_icon" title="Toggle Selection Mode">
+                        <i class="fa-solid fa-check-square"></i>
+                    </div>
+                    <div id="persona-select-all-btn" class="menu_button menu_button_icon" title="Select All" style="display: none;">
+                        <i class="fa-solid fa-check-double"></i>
+                    </div>
+                    <div id="persona-delete-selected-btn" class="menu_button menu_button_icon danger" title="Delete Selected" style="display: none;">
+                        <i class="fa-solid fa-trash"></i>
+                        <span id="persona-selected-count">(0)</span>
+                    </div>
+                </div>
+            </div>
+            <div class="inline-assets-status">
+                <span id="persona-assets-count">Loading...</span>
+            </div>
+            <div id="persona-inline-assets-gallery" class="inline-assets-gallery">
+                <div class="inline-assets-loading">
+                    <i class="fa-solid fa-spinner fa-spin"></i>
+                    <span>Loading assets...</span>
+                </div>
+            </div>
+        `;
+
+        const fileInput = container.querySelector('#persona-asset-upload-input');
+        const gallery = container.querySelector('#persona-inline-assets-gallery');
+
+        // Drag and drop
+        gallery.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            gallery.classList.add('drag-over');
+        });
+        gallery.addEventListener('dragleave', (e) => {
+            e.preventDefault();
+            gallery.classList.remove('drag-over');
+        });
+        gallery.addEventListener('drop', async (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            gallery.classList.remove('drag-over');
+            
+            const files = e.dataTransfer.files;
+            if (files && files.length > 0) {
+                await handlePersonaFileUpload(files, personaName, container);
+            }
+        });
+        fileInput.addEventListener('change', async (e) => {
+            if (e.target.files.length) {
+                await handlePersonaFileUpload(e.target.files, personaName, container);
+                e.target.value = '';
+            }
+        });
+
+        // Refresh button
+        container.querySelector('#persona-refresh-assets-btn').addEventListener('click', async () => {
+            await initializePersonaAssetList(container, personaName);
+            toastr.success('Persona assets refreshed');
+        });
+
+        // Download ZIP button
+        container.querySelector('#persona-download-zip-btn').addEventListener('click', async () => {
+            await downloadPersonaAssetsAsZip(personaName, container);
+        });
+
+        // Generate prompt button - for lorebook
+        container.querySelector('#persona-generate-prompt-btn').addEventListener('click', async () => {
+            const assets = getPersonaAssetsRaw(personaName);
+            if (assets.length === 0) {
+                toastr.info("No assets available.");
+                return;
+            }
+            const compressedNames = compressAssetNames(assets.map(asset => asset.name));
+            const promptText = `### {{user}}'s Image Asset Usage Guide
+
+**Overview:**
+You have access to pre-defined images for this persona ({{user}}). Use them to visually enhance descriptions of {{user}}'s actions and expressions when appropriate.
+
+**How to Display an Image:**
+Use the tag \`%%img:filename%%\` in your response. Do not include the file extension.
+
+**Available Image Filenames:**
+${compressedNames}
+
+**Format Guide:**
+- \`name_[a, b, c]\` (underscore-separated) → Files exist as \`name_a\`, \`name_b\`, \`name_c\` → Use \`%%img:name_a%%\`
+- \`name [a, b, c]\` (space-separated) → Files exist as \`name a\`, \`name b\`, \`name c\` → Use \`%%img:name a%%\`
+- \`name.1~3\` → Files exist as \`name.1\`, \`name.2\`, \`name.3\` → Use \`%%img:name.1%%\`
+
+**Note:**
+If there are variations in numbers, do not use them consecutively.
+These are {{user}}'s (persona's) images - use them when describing {{user}}'s expressions, actions, or appearance.`;
+            
+            try {
+                await navigator.clipboard.writeText(promptText);
+                toastr.success("Prompt copied! Paste it into your persona's linked Lorebook entry.");
+            } catch (err) {
+                toastr.error("Failed to copy.");
+            }
+        });
+
+        // Selection mode toggle
+        container.querySelector('#persona-toggle-selection-btn').addEventListener('click', () => {
+            isPersonaSelectionMode = !isPersonaSelectionMode;
+            personaSelectedAssets.clear();
+            updatePersonaSelectionUI(container);
+        });
+
+        // Select all button
+        container.querySelector('#persona-select-all-btn').addEventListener('click', () => {
+            const assets = getPersonaAssetsRaw(personaName);
+            if (personaSelectedAssets.size === assets.length) {
+                personaSelectedAssets.clear();
+            } else {
+                assets.forEach((_, index) => personaSelectedAssets.add(index));
+            }
+            updatePersonaSelectionUI(container);
+        });
+
+        // Delete selected button
+        container.querySelector('#persona-delete-selected-btn').addEventListener('click', async () => {
+            if (personaSelectedAssets.size === 0) return;
+            
+            if (confirm(`Are you sure you want to delete ${personaSelectedAssets.size} selected asset(s)?`)) {
+                const assets = getPersonaAssetsRaw(personaName);
+                const toDelete = Array.from(personaSelectedAssets).sort((a, b) => b - a);
+                
+                // Delete files
+                const filenames = toDelete
+                    .map(idx => assets[idx])
+                    .filter(asset => asset && asset.filename)
+                    .map(asset => asset.filename);
+                
+                for (const filename of filenames) {
+                    await deletePersonaImageFile(personaName, filename);
+                }
+                
+                // Update settings
+                const newAssets = assets.filter((_, idx) => !personaSelectedAssets.has(idx));
+                await savePersonaAssets(personaName, newAssets);
+                
+                personaSelectedAssets.clear();
+                isPersonaSelectionMode = false;
+                
+                toastr.success(`Deleted ${toDelete.length} asset(s)`);
+                await initializePersonaAssetList(container, personaName);
+            }
+        });
+        
+        setupPersonaPopupEventListeners(container, personaName);
+        
+        // Initial Load
+        await initializePersonaAssetList(container, personaName);
+        
+        return container;
+    }
+
+    function updatePersonaSelectionUI(container) {
+        const selectAllBtn = container.querySelector('#persona-select-all-btn');
+        const deleteSelectedBtn = container.querySelector('#persona-delete-selected-btn');
+        const selectedCountSpan = container.querySelector('#persona-selected-count');
+        const toggleBtn = container.querySelector('#persona-toggle-selection-btn');
+        const gallery = container.querySelector('#persona-inline-assets-gallery');
+        
+        if (isPersonaSelectionMode) {
+            selectAllBtn.style.display = '';
+            deleteSelectedBtn.style.display = '';
+            toggleBtn.classList.add('active');
+            gallery.classList.add('selection-mode');
+        } else {
+            selectAllBtn.style.display = 'none';
+            deleteSelectedBtn.style.display = 'none';
+            toggleBtn.classList.remove('active');
+            gallery.classList.remove('selection-mode');
+        }
+        
+        selectedCountSpan.textContent = `(${personaSelectedAssets.size})`;
+        
+        gallery.querySelectorAll('.asset-checkbox').forEach(checkbox => {
+            const index = parseInt(checkbox.dataset.index);
+            checkbox.checked = personaSelectedAssets.has(index);
+        });
+    }
+
+    function setupPersonaPopupEventListeners(popupContainer, personaName) {
+        const tagFilterContainer = popupContainer.querySelector('#persona-inline-assets-tag-filter-container');
+        const gallery = popupContainer.querySelector('#persona-inline-assets-gallery');
+        
+        // Tag filter click handler
+        tagFilterContainer.addEventListener('click', async (event) => {
+            const tagFilter = event.target.closest('.tag-filter');
+            if (tagFilter) {
+                tagFilter.classList.toggle('active');
+                await initializePersonaAssetList(popupContainer, personaName);
+            }
+        }, { passive: true });
+
+        // Gallery click handler
+        gallery.addEventListener('click', async (event) => {
+            const target = event.target;
+            
+            // Handle checkbox clicks in selection mode
+            const checkbox = target.closest('.asset-checkbox');
+            if (checkbox && isPersonaSelectionMode) {
+                const index = parseInt(checkbox.dataset.index);
+                if (checkbox.checked) {
+                    personaSelectedAssets.add(index);
+                } else {
+                    personaSelectedAssets.delete(index);
+                }
+                updatePersonaSelectionUI(popupContainer);
+                return;
+            }
+            
+            // Handle item click in selection mode
+            if (isPersonaSelectionMode) {
+                const item = target.closest('.inline-assets-item');
+                if (item && !target.closest('input') && !target.closest('.inline-assets-item-actions')) {
+                    const checkbox = item.querySelector('.asset-checkbox');
+                    if (checkbox) {
+                        checkbox.checked = !checkbox.checked;
+                        const index = parseInt(checkbox.dataset.index);
+                        if (checkbox.checked) {
+                            personaSelectedAssets.add(index);
+                        } else {
+                            personaSelectedAssets.delete(index);
+                        }
+                        updatePersonaSelectionUI(popupContainer);
+                    }
+                    return;
+                }
+            }
+            
+            const deleteButton = target.closest('[data-action="delete"]');
+            const deleteTagButton = target.closest('[data-action="delete-tag"]');
+            const previewImage = target.closest('[data-action="preview"]');
+            
+            if (!deleteButton && !deleteTagButton && !previewImage) return;
+            
+            event.stopPropagation();
+            event.preventDefault();
+            
+            const assets = getPersonaAssetsRaw(personaName);
+
+            if (previewImage) {
+                const index = parseInt(previewImage.dataset.index, 10);
+                if (assets[index]) {
+                    requestAnimationFrame(() => {
+                        const asset = assets[index];
+                        const imageSource = asset.url || asset.data;
+                        showImagePreview(imageSource, asset.name);
+                    });
+                }
+            } else if (deleteButton) {
+                const index = parseInt(deleteButton.dataset.index, 10);
+                const asset = assets[index];
+                if (confirm(`Are you sure you want to delete the asset "${asset.name}"?`)) {
+                    if (asset.filename) {
+                        await deletePersonaImageFile(personaName, asset.filename);
+                    }
+                    
+                    assets.splice(index, 1);
+                    await savePersonaAssets(personaName, assets);
+                    await initializePersonaAssetList(popupContainer, personaName);
+                }
+            } else if (deleteTagButton) {
+                const tagElement = target.closest('.inline-asset-tag');
+                const index = parseInt(tagElement.dataset.index, 10);
+                const tagToRemove = tagElement.dataset.tag;
+                if(assets[index]?.tags) {
+                    assets[index].tags = assets[index].tags.filter(t => t !== tagToRemove);
+                    await savePersonaAssets(personaName, assets);
+                    await initializePersonaAssetList(popupContainer, personaName);
+                }
+            }
+        });
+
+        // Name change handler
+        gallery.addEventListener('change', async (event) => {
+            if (!event.target.classList.contains('inline-assets-item-name')) return;
+            
+            const assets = getPersonaAssetsRaw(personaName);
+            const index = parseInt(event.target.dataset.index, 10);
+            const originalName = assets[index].name;
+            const newName = event.target.value.trim();
+
+            if (!newName) {
+                toastr.error("Asset name cannot be empty.");
+                event.target.value = originalName;
+                return;
+            }
+            if (assets.some((a, i) => i !== index && a.name === newName)) {
+                toastr.error(`An asset with the name "${newName}" already exists.`);
+                event.target.value = originalName;
+                return;
+            }
+            assets[index].name = newName;
+            await savePersonaAssets(personaName, assets);
+        });
+
+        // Tag input handler
+        gallery.addEventListener('keydown', async (event) => {
+            if (!event.target.classList.contains('inline-asset-tag-input') || event.key !== 'Enter') return;
+            
+            event.preventDefault();
+            const newTag = event.target.value.trim().toLowerCase();
+            if (newTag) {
+                const assets = getPersonaAssetsRaw(personaName);
+                const index = parseInt(event.target.dataset.index, 10);
+                if (!assets[index].tags) assets[index].tags = [];
+                if (!assets[index].tags.includes(newTag)) {
+                    assets[index].tags.push(newTag);
+                    await savePersonaAssets(personaName, assets);
+                    await initializePersonaAssetList(popupContainer, personaName);
+                } else {
+                    event.target.value = '';
+                }
+            }
+        });
+    }
+
+    async function handlePersonaFileUpload(files, personaName, popupContainer) {
+        files = Array.from(files);
+        if (!files.length) return;
+        
+        const gallery = popupContainer.querySelector('#persona-inline-assets-gallery');
+        const statusSpan = popupContainer.querySelector('#persona-assets-count');
+        
+        // Validate files
+        const validFiles = [];
+        const invalidFiles = [];
+        
+        for (const file of files) {
+            const validation = validateImageFile(file);
+            if (validation.valid) {
+                validFiles.push(file);
+            } else {
+                invalidFiles.push({ file, reason: validation.reason });
+            }
+        }
+        
+        if (invalidFiles.length > 0) {
+            invalidFiles.forEach(({ file, reason }) => {
+                toastr.warning(`${file.name}: ${reason}`);
+            });
+        }
+        
+        if (validFiles.length === 0) {
+            if (invalidFiles.length > 0) {
+                toastr.error('No valid files to upload.');
+            }
+            return;
+        }
+        
+        const totalFiles = validFiles.length;
+        let completedFiles = 0;
+        const updateProgress = () => {
+            const percent = Math.round((completedFiles / totalFiles) * 100);
+            statusSpan.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> Uploading ${completedFiles}/${totalFiles} (${percent}%)...`;
+        };
+        updateProgress();
+        
+        const assets = getPersonaAssetsRaw(personaName);
+        const existingNames = new Set(assets.map(asset => asset.name));
+        
+        if (!csrfDisabled) {
+            await fetchCsrfToken();
+        }
+        
+        const filesToUpload = [];
+        let skippedUploads = 0;
+        
+        for (const file of validFiles) {
+            const nameWithoutExtension = file.name.substring(0, file.name.lastIndexOf('.'));
+            if (existingNames.has(nameWithoutExtension)) {
+                skippedUploads++;
+                completedFiles++;
+            } else {
+                filesToUpload.push(file);
+                existingNames.add(nameWithoutExtension);
+            }
+        }
+        
+        updateProgress();
+        
+        if (filesToUpload.length === 0) {
+            if (skippedUploads > 0) {
+                toastr.warning(`Skipped ${skippedUploads} file(s) that already exist.`);
+            }
+            await initializePersonaAssetList(popupContainer, personaName);
+            return;
+        }
+        
+        const CONCURRENT_UPLOADS = 4;
+        const results = [];
+        
+        for (let i = 0; i < filesToUpload.length; i += CONCURRENT_UPLOADS) {
+            const batch = filesToUpload.slice(i, i + CONCURRENT_UPLOADS);
+            
+            const batchPromises = batch.map(async (file) => {
+                try {
+                    const savedFile = await savePersonaImageFile(personaName, file.name, file);
+                    completedFiles++;
+                    updateProgress();
+                    return { success: true, file: savedFile };
+                } catch (error) {
+                    console.error(`[InlineImageAssets] Failed to upload persona asset ${file.name}:`, error);
+                    completedFiles++;
+                    updateProgress();
+                    return { success: false, error, fileName: file.name };
+                }
+            });
+            
+            const batchResults = await Promise.all(batchPromises);
+            results.push(...batchResults);
+        }
+        
+        const newAssets = [];
+        let successfulUploads = 0;
+        let failedUploads = 0;
+        
+        for (const result of results) {
+            if (result.success) {
+                newAssets.push({
+                    name: result.file.name,
+                    filename: result.file.filename,
+                    path: result.file.path,
+                    url: result.file.url,
+                    tags: []
+                });
+                successfulUploads++;
+            } else {
+                failedUploads++;
+            }
+        }
+
+        if (successfulUploads > 0) {
+            const updatedAssets = [...assets, ...newAssets];
+            await savePersonaAssets(personaName, updatedAssets);
+            toastr.success(`Successfully uploaded ${successfulUploads} file(s).`);
+        }
+        
+        if (failedUploads > 0) {
+            toastr.error(`Failed to upload ${failedUploads} file(s).`);
+        }
+        
+        if (skippedUploads > 0) {
+            toastr.info(`Skipped ${skippedUploads} file(s) that already exist.`);
+        }
+        
+        await initializePersonaAssetList(popupContainer, personaName);
+    }
+
+    async function downloadPersonaAssetsAsZip(personaName, popupContainer) {
+        const statusSpan = popupContainer.querySelector('#persona-assets-count');
+        const originalStatus = statusSpan.textContent;
+        
+        try {
+            const assets = getPersonaAssetsRaw(personaName);
+            
+            if (assets.length === 0) {
+                toastr.info('No assets to download');
+                return;
+            }
+            
+            statusSpan.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> Preparing ZIP (0/${assets.length})...`;
+            
+            if (typeof JSZip === 'undefined') {
+                statusSpan.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> Loading ZIP library...`;
+                await loadJSZip();
+            }
+            
+            const zip = new JSZip();
+            let downloadedCount = 0;
+            let failedCount = 0;
+            
+            for (const asset of assets) {
+                try {
+                    const imageUrl = asset.url || asset.data;
+                    if (!imageUrl) {
+                        failedCount++;
+                        continue;
+                    }
+                    
+                    let blob;
+                    if (imageUrl.startsWith('data:')) {
+                        blob = base64ToBlob(imageUrl);
+                    } else {
+                        const response = await fetch(imageUrl);
+                        if (!response.ok) {
+                            failedCount++;
+                            continue;
+                        }
+                        blob = await response.blob();
+                    }
+                    
+                    let filename = asset.filename || asset.name;
+                    if (!filename.includes('.')) {
+                        const ext = getExtensionFromMime(blob.type);
+                        filename = `${filename}.${ext}`;
+                    }
+                    
+                    zip.file(filename, blob);
+                    downloadedCount++;
+                    
+                    statusSpan.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> Preparing ZIP (${downloadedCount}/${assets.length})...`;
+                } catch (error) {
+                    console.error(`[InlineImageAssets] Failed to add ${asset.name} to ZIP:`, error);
+                    failedCount++;
+                }
+            }
+            
+            if (downloadedCount === 0) {
+                toastr.error('No assets could be downloaded');
+                statusSpan.textContent = originalStatus;
+                return;
+            }
+            
+            statusSpan.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> Generating ZIP file...`;
+            
+            const zipBlob = await zip.generateAsync({
+                type: 'blob',
+                compression: 'DEFLATE',
+                compressionOptions: { level: 6 }
+            }, (metadata) => {
+                const percent = Math.round(metadata.percent);
+                statusSpan.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> Compressing... ${percent}%`;
+            });
+            
+            const sanitizedName = sanitizeFilename(personaName);
+            const downloadName = `${sanitizedName}_persona_assets.zip`;
+            
+            const url = URL.createObjectURL(zipBlob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = downloadName;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            
+            statusSpan.textContent = originalStatus;
+            
+            if (failedCount > 0) {
+                toastr.warning(`Downloaded ${downloadedCount} assets, ${failedCount} failed`);
+            } else {
+                toastr.success(`Downloaded ${downloadedCount} assets as ZIP`);
+            }
+        } catch (error) {
+            console.error('[InlineImageAssets] Persona ZIP download failed:', error);
+            toastr.error('Failed to create ZIP file');
+            statusSpan.textContent = originalStatus;
+        }
+    }
+
+    async function initializePersonaAssetList(popupContainer, personaName) {
+        const gallery = popupContainer.querySelector('#persona-inline-assets-gallery');
+        const statusSpan = popupContainer.querySelector('#persona-assets-count');
+        
+        gallery.innerHTML = `
+            <div class="inline-assets-loading">
+                <i class="fa-solid fa-spinner fa-spin"></i>
+                <span>Loading assets...</span>
+            </div>
+        `;
+        
+        // Get assets from settings
+        let assets = getPersonaAssetsRaw(personaName);
+        
+        // Also try to load from file system
+        const fileAssets = await listPersonaImages(personaName);
+        
+        // Merge sources
+        const assetMap = new Map();
+        
+        assets.forEach(a => assetMap.set(a.name, a));
+        
+        fileAssets.forEach(a => {
+            if (!assetMap.has(a.name)) {
+                assetMap.set(a.name, a);
+            } else {
+                const existing = assetMap.get(a.name);
+                if (!existing.url && a.url) {
+                    existing.url = a.url;
+                    existing.filename = a.filename;
+                    existing.path = a.path;
+                }
+            }
+        });
+        
+        assets = Array.from(assetMap.values());
+        
+        const filterContainer = popupContainer.querySelector('#persona-inline-assets-tag-filter-container');
+        const activeFilterTags = new Set(Array.from(filterContainer.querySelectorAll('.tag-filter.active')).map(el => el.dataset.tag));
+        
+        // Update tag filters
+        const allTags = new Set(assets.flatMap(asset => asset.tags || []));
+        filterContainer.innerHTML = '';
+        const sortedTags = Array.from(allTags).sort();
+        sortedTags.forEach(tag => {
+            const tagEl = document.createElement('span');
+            tagEl.className = 'tag-filter';
+            tagEl.dataset.tag = tag;
+            tagEl.textContent = tag;
+            if (activeFilterTags.has(tag)) tagEl.classList.add('active');
+            filterContainer.appendChild(tagEl);
+        });
+
+        if (!assets || assets.length === 0) {
+            gallery.innerHTML = '<div class="inline-assets-placeholder"><p>No images uploaded yet. Drag & drop files here or use the "Upload" button.</p></div>';
+            statusSpan.textContent = '0 assets';
+            return;
+        }
+
+        currentPersonaPopupAssets = activeFilterTags.size === 0
+            ? [...assets]
+            : assets.filter(asset => asset.tags && asset.tags.some(tag => activeFilterTags.has(tag)));
+
+        if (currentPersonaPopupAssets.length === 0) {
+            gallery.innerHTML = '<div class="inline-assets-placeholder"><p>No assets match the current tag filter.</p></div>';
+            statusSpan.textContent = `0 of ${assets.length} assets (filtered)`;
+            return;
+        }
+
+        statusSpan.textContent = `${currentPersonaPopupAssets.length} assets`;
+
+        gallery.innerHTML = '';
+        
+        personaSelectedAssets.clear();
+        updatePersonaSelectionUI(popupContainer);
+        
+        // Render grouped view
+        try {
+            renderPersonaGroupedAssets(popupContainer, personaName, assets);
+        } catch (error) {
+            console.error('[InlineImageAssets] Error rendering persona assets:', error);
+            gallery.innerHTML = `<div class="inline-assets-placeholder"><p>Error loading assets: ${error.message}</p></div>`;
+        }
+    }
+
+    function renderPersonaGroupedAssets(popupContainer, personaName, rawAssets) {
+        const gallery = popupContainer.querySelector('#persona-inline-assets-gallery');
+        
+        const groups = groupAssetsByFolder(currentPersonaPopupAssets);
+        const sortedGroupNames = Array.from(groups.keys()).sort((a, b) => a.localeCompare(b));
+        
+        const fragment = document.createDocumentFragment();
+        
+        sortedGroupNames.forEach(groupName => {
+            const groupAssets = groups.get(groupName);
+            const isMultiple = groupAssets.length > 1;
+            
+            const groupContainer = document.createElement('div');
+            groupContainer.className = 'inline-assets-group';
+            if (!isMultiple) {
+                groupContainer.classList.add('single-item');
+            }
+            groupContainer.dataset.groupName = groupName;
+            
+            if (isMultiple) {
+                groupContainer.classList.add('collapsed');
+                
+                const folderHeader = document.createElement('div');
+                folderHeader.className = 'inline-assets-folder-header';
+                folderHeader.innerHTML = `
+                    <i class="fa-solid fa-folder"></i>
+                    <span class="folder-name">${groupName}</span>
+                    <span class="folder-count">(${groupAssets.length})</span>
+                    <i class="fa-solid fa-chevron-right folder-toggle"></i>
+                `;
+                folderHeader.addEventListener('click', () => {
+                    groupContainer.classList.toggle('collapsed');
+                    const toggleIcon = folderHeader.querySelector('.folder-toggle');
+                    toggleIcon.classList.toggle('fa-chevron-down');
+                    toggleIcon.classList.toggle('fa-chevron-right');
+                });
+                groupContainer.appendChild(folderHeader);
+            }
+            
+            const itemsContainer = document.createElement('div');
+            itemsContainer.className = 'inline-assets-group-items';
+            
+            groupAssets.forEach(asset => {
+                const assetIndex = rawAssets.findIndex(a => a.name === asset.name);
+                
+                if (assetIndex === -1) {
+                    console.warn('[InlineImageAssets] Persona asset not found:', asset.name);
+                    return;
+                }
+                
+                const item = document.createElement('div');
+                item.className = 'inline-assets-item';
+                if (personaSelectedAssets.has(assetIndex)) {
+                    item.classList.add('selected');
+                }
+                
+                const escapedName = asset.name.replace(/"/g, '&quot;');
+                const imageSource = asset.url || asset.data || '';
+                
+                item.innerHTML = `
+                    <input type="checkbox" class="asset-checkbox" data-index="${assetIndex}" ${personaSelectedAssets.has(assetIndex) ? 'checked' : ''} style="${isPersonaSelectionMode ? '' : 'display: none;'}">
+                    <img src="${imageSource}" class="inline-assets-item-preview" loading="lazy" data-action="preview" data-index="${assetIndex}" onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>❌</text></svg>'">
+                    <input type="text" class="text_pole inline-assets-item-name" value="${escapedName}" data-index="${assetIndex}">
+                    <div class="inline-assets-item-tags">
+                        ${(asset.tags || []).map(tag => `<span class="inline-asset-tag" data-index="${assetIndex}" data-tag="${tag}">${tag}<i class="fa-solid fa-times-circle" data-action="delete-tag"></i></span>`).join('')}
+                        <input type="text" class="inline-asset-tag-input" placeholder="+ Add tag" data-index="${assetIndex}">
+                    </div>
+                    <div class="inline-assets-item-actions">
+                        <div class="menu_button menu_button_icon" data-action="delete" data-index="${assetIndex}" title="Delete">
+                            <i class="fa-solid fa-trash"></i>
+                        </div>
+                    </div>
+                `;
+                itemsContainer.appendChild(item);
+            });
+            
+            groupContainer.appendChild(itemsContainer);
+            fragment.appendChild(groupContainer);
+        });
+        
+        gallery.appendChild(fragment);
+    }
     
     function debounce(func, wait) {
         let timeout;
@@ -3835,6 +5096,7 @@ If there are variations in numbers, do not use them consecutively.`;
     
     function onUiLoaded() {
         injectButton();
+        injectPersonaButton();
 
         const chatElement = document.getElementById('chat');
         if(chatElement) {
@@ -3854,6 +5116,16 @@ If there are variations in numbers, do not use them consecutively.`;
                 applyContentVisibility(); // Refresh content visibility hints
                 updateAssetRenderingState();
                 injectButton();
+                injectPersonaButton();
+            }, 200);
+        });
+        
+        // Listen for persona changes
+        eventSource.on(event_types.SETTINGS_UPDATED, () => {
+            // Persona might have changed - invalidate persona cache
+            invalidatePersonaAssetCache();
+            setTimeout(() => {
+                injectPersonaButton();
             }, 200);
         });
         
@@ -3879,8 +5151,9 @@ If there are variations in numbers, do not use them consecutively.`;
             }, 100);
         });
 
-        console.log('[InlineImageAssets] File System Based v5.0 Loaded.');
+        console.log('[InlineImageAssets] File System Based v5.1 Loaded.');
         console.log('[InlineImageAssets] Global Performance Booster: ALWAYS ACTIVE');
+        console.log('[InlineImageAssets] Persona Asset Support: ENABLED');
         console.log(`[InlineImageAssets] Asset Rendering: ${isAssetRenderingActive ? 'ACTIVE' : 'DORMANT'}`);
     }
 
@@ -3890,5 +5163,13 @@ If there are variations in numbers, do not use them consecutively.`;
             setTimeout(onUiLoaded, 500);
         }
     }, 100);
+
+    // Also try to inject persona button when persona panel becomes available
+    const personaInterval = setInterval(() => {
+        if (document.querySelector('#persona_controls .persona_controls_buttons_block')) {
+            clearInterval(personaInterval);
+            setTimeout(injectPersonaButton, 500);
+        }
+    }, 500);
 
 })();

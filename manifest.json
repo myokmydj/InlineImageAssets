@@ -1,9 +1,9 @@
 {
     "name": "Inline Image Assets",
     "display_name": "Inline Image Assets + Performance Booster",
-    "description": "File system based image asset manager with charx support. Stores images in user/images/{characterName}/ for better performance. Includes bulk delete, migration from base64, and CSS containment optimization.",
+    "description": "File system based image asset manager with charx support and persona assets. Stores images in user/files/ for both characters and personas. Includes bulk delete, migration from base64, and CSS containment optimization. AI can use both character and persona assets with %%img:name%% tags.",
     "author": "User-inspired",
-    "version": "5.0.0",
+    "version": "5.1.0",
     "loading_order": 5,
     "js": "index.js",
     "css": "style.css",
