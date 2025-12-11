@@ -8,7 +8,7 @@ A powerful SillyTavern extension for managing and displaying inline image assets
 
 **Inline Image Assets** transforms how you manage and display character images in SillyTavern. Instead of embedding large base64 data in character cards, this extension stores images as separate files, dramatically improving performance and enabling features like:
 
-- Display character expressions and poses inline within chat messages
+- Display character and persona expressions and poses inline within chat messages
 - Manage thousands of assets without lag or memory issues
 - Seamless integration with charx character format
 - AI-friendly asset prompts for automatic image insertion
@@ -206,7 +206,6 @@ This is usually a CSRF token issue:
 - 📁 Folder-based asset grouping in UI
 - ☑️ Multi-select deletion mode
 - 📦 ZIP download feature
-- 🔍 Auto-scan user/images/ directory
 - 🌐 Unicode character name support
 - 🔄 Legacy base64 migration tool
 
