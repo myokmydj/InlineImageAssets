@@ -105,7 +105,7 @@ This extension also supports **Persona assets** as a fallback when a character a
 ### Generating AI Prompts
 
 1. Click the **📄 Copy Asset List** button
-2. Paste the generated prompt into your character's description or system prompt
+2. Paste the generated prompt into your character's WI (It's good work for AN↑)
 3. The AI will know which images are available and how to use them
 
 **Generated Prompt Example:**
