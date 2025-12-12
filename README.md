@@ -10,7 +10,6 @@ A powerful SillyTavern extension for managing and displaying inline image assets
 
 - Display character expressions and poses inline within chat messages
 - Manage thousands of assets without lag or memory issues
-- Seamless integration with charx character format
 - AI-friendly asset prompts for automatic image insertion
 
 ---
@@ -233,7 +232,6 @@ This is usually a CSRF token issue:
 - 🔄 Legacy base64 migration tool
 
 ### Version 4.x
-- Added charx asset import
 - Improved tag filtering
 - Performance optimizations
 
