@@ -216,6 +216,81 @@ import { eventSource, event_types } from "../../../../script.js";
     }
 
     /**
+     * Sanitizes a filename base (without extension) for SillyTavern /api/images/upload
+     * Keeps only [a-zA-Z0-9._-] and converts spaces to underscores.
+     * @param {string} baseName
+     * @returns {string}
+     */
+    function sanitizeImageBaseName(baseName) {
+        let name = (baseName || '').toString().trim();
+        name = name.replace(/\s+/g, '_');
+        name = name.replace(/[^a-zA-Z0-9._-]/g, '_');
+        name = name.replace(/_+/g, '_');
+        name = name.replace(/^_+|_+$/g, '');
+        if (!name) name = 'unnamed';
+        return name;
+    }
+
+    /**
+     * Creates a stable, comparable key for an asset name.
+     * Used to dedupe between:
+     * - user-provided names (may contain spaces/unicode)
+     * - actual stored filenames for /api/images (sanitized base names)
+     * @param {string} name
+     * @returns {string}
+     */
+    function getCanonicalAssetKey(name) {
+        return sanitizeImageBaseName(name).toLowerCase();
+    }
+
+    /**
+     * Normalizes image format/extension from a filename extension or MIME type.
+     * @param {string} extOrMime
+     * @returns {string}
+     */
+    function normalizeImageFormat(extOrMime) {
+        let format = (extOrMime || '').toString().trim().toLowerCase();
+        if (format.startsWith('image/')) {
+            format = format.substring('image/'.length);
+        }
+        if (format === 'svg+xml') format = 'svg';
+        if (format === 'jpeg') format = 'jpg';
+        format = format.replace(/[^a-z0-9]/g, '');
+        return format;
+    }
+
+    /**
+     * Splits and sanitizes an incoming filename into { baseName, format, fullFilename } for /api/images/upload.
+     * @param {string} originalFilename
+     * @param {string} mimeType
+     */
+    function getImageNameAndFormat(originalFilename, mimeType) {
+        const rawName = (originalFilename || '').toString().trim();
+        const lastDot = rawName.lastIndexOf('.');
+
+        let base = rawName;
+        let ext = '';
+        if (lastDot > 0 && lastDot < rawName.length - 1) {
+            base = rawName.substring(0, lastDot);
+            ext = rawName.substring(lastDot + 1);
+        }
+
+        let format = normalizeImageFormat(ext);
+        if (!format) {
+            format = normalizeImageFormat(mimeType);
+        }
+        if (!format || !SUPPORTED_FORMATS.includes(format)) {
+            // Best-effort fallback for unknown/unsupported types
+            format = 'png';
+        }
+
+        const baseName = sanitizeImageBaseName(base);
+        const fullFilename = `${baseName}.${format}`;
+
+        return { baseName, format, fullFilename };
+    }
+
+    /**
      * Sanitizes a full path by sanitizing each segment individually
      * @param {string} fullPath - Full path with slashes
      * @returns {string} - Sanitized path
@@ -371,6 +446,90 @@ import { eventSource, event_types } from "../../../../script.js";
             const prefix = getCharacterFilePrefix(characterName);
             const sanitizedName = sanitizePathSegment(characterName);
             log(`Listing images for character "${characterName}" (sanitized: "${sanitizedName}") with prefix "${prefix}"`);
+
+            // === APPROACH 0: SillyTavern Images API (/api/images/list) ===
+            // Proper per-character folder listing under user/images/{characterName}/
+            {
+                const foldersToTry = [characterName];
+                if (sanitizedName && sanitizedName !== characterName) foldersToTry.push(sanitizedName);
+
+                for (const folder of foldersToTry) {
+                    try {
+                        let headers = await getApiHeaders();
+                        let response = await fetch('/api/images/list', {
+                            method: 'POST',
+                            headers,
+                            body: JSON.stringify({
+                                folder,
+                                sortField: 'date',
+                                sortOrder: 'desc',
+                            }),
+                        });
+
+                        if (response.status === 403) {
+                            log('[InlineImageAssets] Got 403 on /api/images/list, refreshing CSRF token and retrying...');
+                            invalidateCsrfToken();
+                            csrfDisabled = false;
+                            headers = await getApiHeaders();
+                            response = await fetch('/api/images/list', {
+                                method: 'POST',
+                                headers,
+                                body: JSON.stringify({
+                                    folder,
+                                    sortField: 'date',
+                                    sortOrder: 'desc',
+                                }),
+                            });
+                        }
+
+                        if (response.status === 404) {
+                            // Images API not available on this server.
+                            break;
+                        }
+
+                        if (response.ok) {
+                            const result = await response.json();
+                            if (Array.isArray(result) && result.length > 0) {
+                                log(`Images API list found for folder "${folder}", count: ${result.length}`);
+
+                                result.forEach((item) => {
+                                    const src = (item && (item.src || item.url || item.path)) || item;
+                                    let fileName = item && (item.name || item.filename);
+                                    if ((!fileName || typeof fileName !== 'string') && typeof src === 'string') {
+                                        fileName = src.split('/').pop();
+                                    }
+                                    if (!fileName || typeof fileName !== 'string') return;
+
+                                    const ext = fileName.split('.').pop()?.toLowerCase();
+                                    if (!SUPPORTED_FORMATS.includes(ext)) return;
+
+                                    const assetName = fileName.substring(0, fileName.lastIndexOf('.'));
+                                    if (seenNames.has(assetName)) return;
+                                    seenNames.add(assetName);
+
+                                    const url = (typeof src === 'string' && src.startsWith('/'))
+                                        ? src
+                                        : `/user/images/${folder}/${fileName}`;
+
+                                    allAssets.push({
+                                        name: assetName,
+                                        filename: fileName,
+                                        path: url,
+                                        url,
+                                        size: item && item.size,
+                                        modified: item && (item.modified || item.mtime),
+                                        isImageDir: true,
+                                    });
+                                });
+
+                                break;
+                            }
+                        }
+                    } catch (e) {
+                        log(`Images API list error for folder "${folder}": ${e.message}`);
+                    }
+                }
+            }
             
             // === APPROACH 1: Flat structure in user/files/ ===
             let flatFiles = [];
@@ -671,114 +830,104 @@ import { eventSource, event_types } from "../../../../script.js";
      */
     async function saveImageFile(characterName, filename, imageData) {
         try {
-            // Sanitize the filename first
-            const sanitizedFilename = sanitizePathSegment(filename);
-            
-            // Check if filename already has our prefix to avoid double-prefixing
-            const prefix = getCharacterFilePrefix(characterName);
-            let fullFilename;
-            if (sanitizedFilename.startsWith(IMAGE_PREFIX)) {
-                // Already has prefix, use as-is
-                fullFilename = sanitizedFilename;
-                log('Filename already has prefix, using as-is:', fullFilename);
-            } else {
-                // Add prefix
-                fullFilename = getAssetFullFilename(characterName, sanitizedFilename);
-                log('Added prefix to filename:', fullFilename);
-            }
-            
-            // Convert blob to base64
+            // Prefer per-character folder storage via /api/images/upload
+            const { baseName, format, fullFilename } = getImageNameAndFormat(filename, imageData?.type);
+
             const base64Data = await blobToBase64(imageData);
-            
-            console.log('[InlineImageAssets] Uploading:', fullFilename);
-            log('Blob type:', imageData.type, 'size:', imageData.size);
-            
-            // Get headers with CSRF token (async)
+            log('Uploading to /api/images/upload:', { characterName, fullFilename, format, dataLength: base64Data.length });
+
             const headers = await getApiHeaders();
-            log('Request headers:', JSON.stringify(headers));
-            
-            log('Upload request - name:', fullFilename, 'dataLength:', base64Data.length);
-            
-            const response = await fetch('/api/files/upload', {
+
+            let response = await fetch('/api/images/upload', {
                 method: 'POST',
                 headers: headers,
                 body: JSON.stringify({
-                    name: fullFilename,
-                    data: base64Data
+                    image: base64Data,
+                    ch_name: characterName,
+                    filename: baseName,
+                    format: format
                 })
             });
-            
-            log('Upload response status:', response.status, response.statusText);
-            
-            if (!response.ok) {
-                const errorText = await response.text();
-                console.error('[InlineImageAssets] Upload response:', response.status, errorText);
-                log('Upload failed - status:', response.status, 'error:', errorText);
-                
-                // If forbidden, try to refresh CSRF token and retry once
-                if (response.status === 403) {
-                    console.log('[InlineImageAssets] Got 403, refreshing CSRF token and retrying...');
+
+            if (!response.ok && response.status === 403) {
+                console.log('[InlineImageAssets] Got 403 on /api/images/upload, refreshing CSRF token and retrying...');
+                invalidateCsrfToken();
+                csrfDisabled = false;
+                const newHeaders = await getApiHeaders();
+                response = await fetch('/api/images/upload', {
+                    method: 'POST',
+                    headers: newHeaders,
+                    body: JSON.stringify({
+                        image: base64Data,
+                        ch_name: characterName,
+                        filename: baseName,
+                        format: format
+                    })
+                });
+            }
+
+            // Fallback: if images API doesn't exist on this server, fall back to legacy /api/files/upload
+            if (!response.ok && response.status === 404) {
+                log('Images API not found (404). Falling back to /api/files/upload flat structure');
+                const sanitizedFilename = sanitizePathSegment(filename);
+                const prefix = getCharacterFilePrefix(characterName);
+                const legacyFullFilename = sanitizedFilename.startsWith(IMAGE_PREFIX)
+                    ? sanitizedFilename
+                    : getAssetFullFilename(characterName, sanitizedFilename);
+
+                const legacyHeaders = await getApiHeaders();
+                let legacyResponse = await fetch('/api/files/upload', {
+                    method: 'POST',
+                    headers: legacyHeaders,
+                    body: JSON.stringify({
+                        name: legacyFullFilename,
+                        data: base64Data
+                    })
+                });
+
+                if (!legacyResponse.ok && legacyResponse.status === 403) {
                     invalidateCsrfToken();
-                    csrfDisabled = false; // Reset disabled flag to try fetching token again
-                    const newHeaders = await getApiHeaders();
-                    log('Retry headers:', JSON.stringify(newHeaders));
-                    
-                    const retryResponse = await fetch('/api/files/upload', {
+                    csrfDisabled = false;
+                    const retryHeaders = await getApiHeaders();
+                    legacyResponse = await fetch('/api/files/upload', {
                         method: 'POST',
-                        headers: newHeaders,
+                        headers: retryHeaders,
                         body: JSON.stringify({
-                            name: fullFilename,
+                            name: legacyFullFilename,
                             data: base64Data
                         })
                     });
-                    
-                    log('Retry response status:', retryResponse.status, retryResponse.statusText);
-                    
-                    if (!retryResponse.ok) {
-                        const retryErrorText = await retryResponse.text();
-                        console.error('[InlineImageAssets] Retry failed:', retryResponse.status, retryErrorText);
-                        throw new Error(`Upload failed after retry: ${retryResponse.status} ${retryErrorText}`);
-                    }
-                    
-                    const retryResult = await retryResponse.json();
-                    console.log('[InlineImageAssets] Upload result (retry):', retryResult);
-                    log('Upload success (retry) - result:', JSON.stringify(retryResult));
-                    
-                    // Extract the display name (without prefix and extension)
-                    const displayName = extractAssetName(fullFilename, characterName);
-                    
-                    // Construct URL - SillyTavern serves files from /user/files/
-                    const fileUrl = `/user/files/${fullFilename}`;
-                    log('Constructed URL (retry):', fileUrl);
-                    
-                    return {
-                        name: displayName,
-                        filename: fullFilename,
-                        path: fullFilename,
-                        url: fileUrl
-                    };
                 }
-                
+
+                if (!legacyResponse.ok) {
+                    const errorText = await legacyResponse.text();
+                    throw new Error(`Upload failed: ${legacyResponse.status} ${errorText}`);
+                }
+
+                const displayName = extractAssetName(legacyFullFilename, characterName);
+                return {
+                    name: displayName,
+                    filename: legacyFullFilename,
+                    path: legacyFullFilename,
+                    url: `/user/files/${legacyFullFilename}`
+                };
+            }
+
+            if (!response.ok) {
+                const errorText = await response.text();
                 throw new Error(`Upload failed: ${response.status} ${errorText}`);
             }
-            
-            const result = await response.json();
-            console.log('[InlineImageAssets] Upload result:', result);
-            log('Upload success - result:', JSON.stringify(result));
-            
-            // Extract the display name (without prefix and extension)
-            const displayName = extractAssetName(fullFilename, characterName);
-            
-            // Construct URL - SillyTavern serves files from /user/files/
-            // Don't use result.path as it may have different format
-            const fileUrl = `/user/files/${fullFilename}`;
-            log('Constructed URL:', fileUrl);
-            
+
+            // Construct URL for user/images
+            const url = `/user/images/${characterName}/${fullFilename}`;
+            const path = `user/images/${characterName}/${fullFilename}`;
+
             return {
-                name: displayName,
+                name: baseName,
                 filename: fullFilename,
-                path: fullFilename,
-                url: fileUrl
+                path: path,
+                url: url,
+                isImageDir: true
             };
         } catch (error) {
             console.error('[InlineImageAssets] Failed to save image:', error);
@@ -950,65 +1099,94 @@ import { eventSource, event_types } from "../../../../script.js";
      * @param {string} filename - Full filename (with prefix) to delete
      * @returns {Promise<boolean>} - Success status
      */
-    async function deleteImageFile(characterName, filename) {
+    async function deleteImageFile(characterName, assetOrFilename) {
         try {
-            // The filename should already be the full flat filename
-            // But if it's just the asset name, construct the full filename
+            const asset = (assetOrFilename && typeof assetOrFilename === 'object') ? assetOrFilename : null;
+            const filename = asset ? asset.filename : assetOrFilename;
+            const candidatePath = asset ? (asset.path || asset.url || '') : '';
+            const isImageDir = !!(asset && asset.isImageDir) || (typeof candidatePath === 'string' && candidatePath.includes('user/images/'));
+
+            // Delete from user/images via /api/images/delete when applicable
+            if (isImageDir) {
+                const headers = await getApiHeaders();
+                let deletePath = candidatePath;
+
+                if (!deletePath && typeof filename === 'string') {
+                    deletePath = `user/images/${characterName}/${filename}`;
+                }
+
+                if (typeof deletePath === 'string') {
+                    deletePath = deletePath.replace(/^\/+/, '');
+                }
+
+                log('Deleting image via /api/images/delete:', deletePath);
+                let response = await fetch('/api/images/delete', {
+                    method: 'POST',
+                    headers: headers,
+                    body: JSON.stringify({ path: deletePath })
+                });
+
+                if (!response.ok && response.status === 403) {
+                    invalidateCsrfToken();
+                    csrfDisabled = false;
+                    const newHeaders = await getApiHeaders();
+                    response = await fetch('/api/images/delete', {
+                        method: 'POST',
+                        headers: newHeaders,
+                        body: JSON.stringify({ path: deletePath })
+                    });
+                }
+
+                if (response.ok) {
+                    return true;
+                }
+
+                const errorText = await response.text().catch(() => '');
+                log('Image delete failed:', response.status, errorText);
+                // Fall through to try legacy delete if needed
+            }
+
+            // Legacy delete in user/files
             const prefix = getCharacterFilePrefix(characterName);
-            const fullFilename = filename.startsWith(prefix) ? filename : getAssetFullFilename(characterName, filename);
-            
-            // SillyTavern's delete API expects just the filename, not a path
-            // The API will look for it in user/files/
-            log('Deleting file:', fullFilename);
-            
-            // Get headers with CSRF token (async)
+            const fullFilename = (typeof filename === 'string' && filename.startsWith(prefix))
+                ? filename
+                : getAssetFullFilename(characterName, filename);
+
+            log('Deleting legacy file via /api/files/delete:', fullFilename);
+
             const headers = await getApiHeaders();
-            
-            // Try different path formats for delete API
             const pathsToTry = [
-                fullFilename,                    // Just filename
-                `files/${fullFilename}`,         // files/filename
-                `/files/${fullFilename}`,        // /files/filename
+                fullFilename,
+                `files/${fullFilename}`,
+                `/files/${fullFilename}`,
             ];
-            
+
             for (const deletePath of pathsToTry) {
-                log('Trying delete path:', deletePath);
-                
                 const response = await fetch('/api/files/delete', {
                     method: 'POST',
                     headers: headers,
                     body: JSON.stringify({ path: deletePath })
                 });
-                
+
                 if (response.ok) {
-                    log('Delete successful with path:', deletePath);
                     return true;
                 }
-                
-                const errorText = await response.text();
-                log('Delete failed with path:', deletePath, 'status:', response.status, 'error:', errorText);
-                
-                // If forbidden, try to refresh CSRF token and retry
+
                 if (response.status === 403) {
-                    console.log('[InlineImageAssets] Got 403, refreshing CSRF token and retrying...');
                     invalidateCsrfToken();
                     csrfDisabled = false;
                     const newHeaders = await getApiHeaders();
-                    
                     const retryResponse = await fetch('/api/files/delete', {
                         method: 'POST',
                         headers: newHeaders,
                         body: JSON.stringify({ path: deletePath })
                     });
-                    
                     if (retryResponse.ok) {
-                        log('Delete successful after CSRF refresh with path:', deletePath);
                         return true;
                     }
                 }
             }
-            
-            console.warn('[InlineImageAssets] Delete failed with all path formats');
+
             return false;
         } catch (error) {
             console.error('[InlineImageAssets] Failed to delete image:', error);
@@ -1022,11 +1200,11 @@ import { eventSource, event_types } from "../../../../script.js";
      * @param {Array<string>} filenames - Array of filenames to delete
      * @returns {Promise<Object>} - Results with success/failure counts
      */
-    async function deleteMultipleImages(characterName, filenames) {
+    async function deleteMultipleImages(characterName, assetsOrFilenames) {
         const results = { success: 0, failed: 0 };
-        
-        for (const filename of filenames) {
-            const success = await deleteImageFile(characterName, filename);
+
+        for (const item of assetsOrFilenames) {
+            const success = await deleteImageFile(characterName, item);
             if (success) {
                 results.success++;
             } else {
@@ -1188,6 +1366,109 @@ import { eventSource, event_types } from "../../../../script.js";
             toastr.warning(`Failed to migrate ${failCount} assets`);
         }
         
+        return migratedAssets;
+    }
+
+    /**
+     * Migrates legacy flat user/files assets to user/images/{characterName}/
+     * This requires SillyTavern's Images API (/api/images/upload).
+     * @param {string} characterName - Character name
+     * @param {Array} legacyFileAssets - Optional array of legacy file assets (from listCharacterImages)
+     * @returns {Promise<Array>} - Array of migrated asset info
+     */
+    async function migrateFilesToCharacterFolder(characterName, legacyFileAssets = null) {
+        const migratedAssets = [];
+        let successCount = 0;
+        let failCount = 0;
+
+        const prefix = getCharacterFilePrefix(characterName);
+
+        // If not provided, list legacy files now
+        let legacyFiles = legacyFileAssets;
+        if (!Array.isArray(legacyFiles)) {
+            legacyFiles = [];
+            const flatPathsToTry = ['', '/'];
+            for (const path of flatPathsToTry) {
+                try {
+                    const apiUrl = `/api/files/list?path=${encodeURIComponent(path)}`;
+                    const response = await fetch(apiUrl);
+                    if (response.ok) {
+                        const result = await response.json();
+                        if (Array.isArray(result) && result.length > 0) {
+                            legacyFiles = result;
+                            break;
+                        }
+                    }
+                } catch (e) {
+                    // ignore
+                }
+            }
+        }
+
+        // Normalize to filenames
+        // IMPORTANT: legacyFileAssets from listCharacterImages() are objects where:
+        // - f.name is the asset display name (no extension, no prefix)
+        // - f.filename is the real filename in user/files (includes prefix + extension)
+        // So we must prefer filename first.
+        const legacyFilenames = legacyFiles
+            .map((f) => (f && (f.filename || f.name)) || f)
+            .filter((name) => typeof name === 'string')
+            .filter((name) => name.startsWith(prefix))
+            .filter((name) => {
+                const ext = name.split('.').pop()?.toLowerCase();
+                return SUPPORTED_FORMATS.includes(ext);
+            });
+
+        if (legacyFilenames.length === 0) {
+            toastr.info('No legacy user/files assets found to migrate.');
+            return [];
+        }
+
+        toastr.info(`Migrating ${legacyFilenames.length} user/files assets to user/images/${characterName}/...`);
+        log('Starting files->images migration for', legacyFilenames.length, 'files');
+
+        for (const legacyFilename of legacyFilenames) {
+            try {
+                const assetName = extractAssetName(legacyFilename, characterName);
+                const ext = legacyFilename.split('.').pop()?.toLowerCase() || 'png';
+                const downloadUrl = `/user/files/${legacyFilename}`;
+
+                const response = await fetch(downloadUrl);
+                if (!response.ok) {
+                    throw new Error(`Failed to download legacy file (${response.status})`);
+                }
+
+                const blob = await response.blob();
+
+                // Upload with clean per-asset filename (avoid including our legacy prefix)
+                const uploaded = await saveImageFile(characterName, `${assetName}.${ext}`, blob);
+
+                // Delete legacy file after successful upload
+                await deleteImageFile(characterName, legacyFilename);
+
+                migratedAssets.push({
+                    name: assetName,
+                    filename: uploaded.filename,
+                    path: uploaded.path,
+                    url: uploaded.url,
+                    tags: [],
+                    isImageDir: true,
+                });
+                successCount++;
+            } catch (error) {
+                console.error(`[InlineImageAssets] Failed to migrate legacy file ${legacyFilename}:`, error);
+                failCount++;
+            }
+        }
+
+        if (successCount > 0) {
+            toastr.success(`Successfully migrated ${successCount} files to user/images/${characterName}/`);
+            invalidateAssetCache();
+        }
+        if (failCount > 0) {
+            toastr.warning(`Failed to migrate ${failCount} files`);
+        }
+
         return migratedAssets;
     }
 
@@ -1549,6 +1830,87 @@ import { eventSource, event_types } from "../../../../script.js";
      * @returns {Promise<Array>} - Array of found assets
      */
     async function scanUserImagesDirectory(characterName, knownNames = []) {
+        // Prefer SillyTavern Images API if available.
+        // If it returns data, it's more reliable than the old HEAD-probing approach.
+        try {
+            const sanitizedName = sanitizePathSegment(characterName);
+            const foldersToTry = [characterName];
+            if (sanitizedName && sanitizedName !== characterName) foldersToTry.push(sanitizedName);
+
+            for (const folder of foldersToTry) {
+                let headers = await getApiHeaders();
+                let response = await fetch('/api/images/list', {
+                    method: 'POST',
+                    headers,
+                    body: JSON.stringify({
+                        folder,
+                        sortField: 'date',
+                        sortOrder: 'desc',
+                    }),
+                });
+
+                if (response.status === 403) {
+                    log('[InlineImageAssets] Got 403 on /api/images/list (scan), refreshing CSRF token and retrying...');
+                    invalidateCsrfToken();
+                    csrfDisabled = false;
+                    headers = await getApiHeaders();
+                    response = await fetch('/api/images/list', {
+                        method: 'POST',
+                        headers,
+                        body: JSON.stringify({
+                            folder,
+                            sortField: 'date',
+                            sortOrder: 'desc',
+                        }),
+                    });
+                }
+
+                if (response.status === 404) {
+                    // No images API on this server; fall back to probing.
+                    break;
+                }
+
+                if (response.ok) {
+                    const result = await response.json();
+                    if (Array.isArray(result)) {
+                        const assets = [];
+                        result.forEach((item) => {
+                            const src = (item && (item.src || item.url || item.path)) || item;
+                            let fileName = item && (item.name || item.filename);
+                            if ((!fileName || typeof fileName !== 'string') && typeof src === 'string') {
+                                fileName = src.split('/').pop();
+                            }
+                            if (!fileName || typeof fileName !== 'string') return;
+
+                            const ext = fileName.split('.').pop()?.toLowerCase();
+                            if (!SUPPORTED_FORMATS.includes(ext)) return;
+
+                            const assetName = fileName.substring(0, fileName.lastIndexOf('.'));
+                            const url = (typeof src === 'string' && src.startsWith('/'))
+                                ? src
+                                : `/user/images/${folder}/${fileName}`;
+
+                            assets.push({
+                                name: assetName,
+                                filename: fileName,
+                                path: url,
+                                url,
+                                tags: [],
+                                isImageDir: true,
+                                size: item && item.size,
+                                modified: item && (item.modified || item.mtime),
+                            });
+                        });
+
+                        // If the API works, trust it (even if empty) to avoid expensive probing.
+                        return assets;
+                    }
+                }
+            }
+        } catch (e) {
+            log('Images API list failed during scan, falling back to probing:', e.message);
+        }
+
         const foundAssets = [];
         const sanitizedName = sanitizePathSegment(characterName);
         const testedUrls = new Set();
@@ -2340,6 +2702,12 @@ import { eventSource, event_types } from "../../../../script.js";
                         assetCache.set(sanitizedName, url);
                         log(`Also cached as sanitized: ${sanitizedName} -> ${url}`);
                     }
+
+                    // Also cache under canonical key (matches /api/images/upload base-name sanitization)
+                    const canonicalKey = getCanonicalAssetKey(asset.name);
+                    if (canonicalKey !== asset.name && !assetCache.has(canonicalKey)) {
+                        assetCache.set(canonicalKey, url);
+                    }
                     
                     // Also cache under lowercase for case-insensitive lookup
                     const lowerName = asset.name.toLowerCase();
@@ -2363,6 +2731,12 @@ import { eventSource, event_types } from "../../../../script.js";
                 const sanitizedName = sanitizeFilename(fa.name);
                 if (sanitizedName !== fa.name && !assetCache.has(sanitizedName)) {
                     assetCache.set(sanitizedName, fa.url);
+                }
+
+                // Also add canonical version
+                const canonicalKey = getCanonicalAssetKey(fa.name);
+                if (canonicalKey !== fa.name && !assetCache.has(canonicalKey)) {
+                    assetCache.set(canonicalKey, fa.url);
                 }
                 
                 // Also add lowercase version for case-insensitive lookup
@@ -2840,7 +3214,7 @@ import { eventSource, event_types } from "../../../../script.js";
         if (isNaN(mesId)) return;
 
         const message = context.chat[mesId];
-        if (!message || message.is_user) return;
+        if (!message) return;
         
         const textElement = messageElement.querySelector('.mes_text');
         if (!textElement) return;
@@ -2862,13 +3236,35 @@ import { eventSource, event_types } from "../../../../script.js";
         // Priority: character cache first, then persona cache as fallback
         const finalHtml = html.replace(tagRegex, (match, assetName) => {
             const trimmedName = assetName.trim();
+
+            // Support tags that include an extension (e.g. %%img:smile.png%%)
+            let baseNameFromExt = null;
+            if (trimmedName.includes('.')) {
+                const lastDot = trimmedName.lastIndexOf('.');
+                if (lastDot > 0 && lastDot < trimmedName.length - 1) {
+                    const maybeExt = trimmedName.substring(lastDot + 1).toLowerCase();
+                    if (SUPPORTED_FORMATS.includes(maybeExt)) {
+                        baseNameFromExt = trimmedName.substring(0, lastDot);
+                    }
+                }
+            }
+
+            const candidates = baseNameFromExt ? [trimmedName, baseNameFromExt] : [trimmedName];
             
+            let assetSource = null;
+
             // Try exact match first (character cache)
-            let assetSource = cache.get(trimmedName);
+            for (const candidate of candidates) {
+                assetSource = cache.get(candidate);
+                if (assetSource) break;
+            }
             
             // If not found in character cache, try persona cache
             if (!assetSource && personaCache.size > 0) {
-                assetSource = personaCache.get(trimmedName);
+                for (const candidate of candidates) {
+                    assetSource = personaCache.get(candidate);
+                    if (assetSource) break;
+                }
                 if (assetSource) {
                     log(`Found asset in persona cache: "${trimmedName}"`);
                 }
@@ -2876,13 +3272,27 @@ import { eventSource, event_types } from "../../../../script.js";
             
             // If not found, try sanitized version (handles spaces -> underscores, etc.)
             if (!assetSource) {
-                const sanitizedName = sanitizeFilename(trimmedName);
-                assetSource = cache.get(sanitizedName);
-                if (!assetSource && personaCache.size > 0) {
-                    assetSource = personaCache.get(sanitizedName);
-                }
-                if (assetSource) {
-                    log(`Found asset via sanitized name: "${trimmedName}" -> "${sanitizedName}"`);
+                for (const candidate of candidates) {
+                    const sanitizedName = sanitizeFilename(candidate);
+                    assetSource = cache.get(sanitizedName);
+                    if (!assetSource && personaCache.size > 0) {
+                        assetSource = personaCache.get(sanitizedName);
+                    }
+                    if (assetSource) {
+                        log(`Found asset via sanitized name: "${trimmedName}" -> "${sanitizedName}"`);
+                        break;
+                    }
+
+                    // Also try canonical key (matches /api/images/upload base-name sanitization)
+                    const canonicalKey = getCanonicalAssetKey(candidate);
+                    assetSource = cache.get(canonicalKey);
+                    if (!assetSource && personaCache.size > 0) {
+                        assetSource = personaCache.get(canonicalKey);
+                    }
+                    if (assetSource) {
+                        log(`Found asset via canonical key: "${trimmedName}" -> "${canonicalKey}"`);
+                        break;
+                    }
                 }
             }
             
@@ -3924,37 +4334,69 @@ If there are variations in numbers, do not use them consecutively.`;
         
         // Get assets from metadata
         let assets = ContextUtil.getAssetsRaw(character);
-        
-        // Check for legacy assets that need migration
+
+        // Migration status: legacy base64 + legacy user/files -> user/images
+        const migrationMessages = [];
+
+        // Legacy base64 assets
         const legacyAssets = assets.filter(a => a.isLegacy || a.data);
         if (legacyAssets.length > 0) {
-            migrationStatus.innerHTML = `<span class="migration-warning"><i class="fa-solid fa-exclamation-triangle"></i> ${legacyAssets.length} legacy assets found. <a href="#" id="migrate-assets-link">Migrate now</a></span>`;
-            
-            popupContainer.querySelector('#migrate-assets-link')?.addEventListener('click', async (e) => {
-                e.preventDefault();
-                const migrated = await migrateLegacyAssets(character.name, legacyAssets);
-                
-                if (migrated.length > 0) {
-                    // Update metadata with migrated assets
-                    const nonLegacyAssets = assets.filter(a => !a.isLegacy && !a.data);
-                    const newAssets = [...nonLegacyAssets, ...migrated];
-                    await ContextUtil.saveAssets(getContext().characterId, newAssets);
-                    
-                    // Clear legacy data
-                    await ContextUtil.clearLegacyAssets(getContext().characterId);
-                    
-                    // Force cache rebuild
-                    invalidateAssetCache();
-                    
-                    await initializeAssetList(popupContainer, character);
-                }
-            });
-        } else {
-            migrationStatus.innerHTML = '';
+            migrationMessages.push(`<span class="migration-warning"><i class="fa-solid fa-exclamation-triangle"></i> ${legacyAssets.length} legacy assets found. <a href="#" id="migrate-assets-link">Migrate now</a></span>`);
         }
         
         // Also try to load from file system (user/files/)
         const fileAssets = await listCharacterImages(character.name);
+
+        // Legacy flat files (user/files/) that can be migrated into user/images/{character}
+        const legacyFileAssets = fileAssets.filter(a => !a.isImageDir && typeof a.filename === 'string' && a.filename.startsWith(getCharacterFilePrefix(character.name)));
+        if (legacyFileAssets.length > 0) {
+            migrationMessages.push(`<span class="migration-warning"><i class="fa-solid fa-exclamation-triangle"></i> ${legacyFileAssets.length} user/files images found. <a href="#" id="migrate-files-link">Move to per-character folder</a></span>`);
+        }
+
+        migrationStatus.innerHTML = migrationMessages.join(' ');
+
+        // Wire legacy base64 migration link
+        popupContainer.querySelector('#migrate-assets-link')?.addEventListener('click', async (e) => {
+            e.preventDefault();
+            const migrated = await migrateLegacyAssets(character.name, legacyAssets);
+
+            if (migrated.length > 0) {
+                // Update metadata with migrated assets
+                const nonLegacyAssets = assets.filter(a => !a.isLegacy && !a.data);
+                const newAssets = [...nonLegacyAssets, ...migrated];
+                await ContextUtil.saveAssets(getContext().characterId, newAssets);
+
+                // Clear legacy data
+                await ContextUtil.clearLegacyAssets(getContext().characterId);
+
+                // Force cache rebuild
+                invalidateAssetCache();
+
+                await initializeAssetList(popupContainer, character);
+            }
+        });
+
+        // Wire user/files -> user/images migration link
+        popupContainer.querySelector('#migrate-files-link')?.addEventListener('click', async (e) => {
+            e.preventDefault();
+
+            const migrated = await migrateFilesToCharacterFolder(character.name, legacyFileAssets);
+            if (migrated.length > 0) {
+                // Merge into metadata, preserving tags if the asset already exists
+                const byName = new Map((assets || []).map(a => [a.name, a]));
+                migrated.forEach((m) => {
+                    const existing = byName.get(m.name);
+                    if (existing) {
+                        m.tags = existing.tags || m.tags || [];
+                    }
+                    byName.set(m.name, { ...(existing || {}), ...m, tags: m.tags || [] });
+                });
+
+                await ContextUtil.saveAssets(getContext().characterId, Array.from(byName.values()));
+                invalidateAssetCache();
+                await initializeAssetList(popupContainer, character);
+            }
+        });
         
         // === NEW: Also scan user/images/{characterName}/ directory ===
         // Get known asset names to help with scanning
@@ -3968,41 +4410,137 @@ If there are variations in numbers, do not use them consecutively.`;
         }
         
         // Merge all sources: metadata + user/files/ + user/images/
-        const assetMap = new Map();
-        
-        // First, add metadata assets
-        assets.forEach(a => assetMap.set(a.name, a));
-        
-        // Then, add/update from user/files/
-        fileAssets.forEach(a => {
-            if (!assetMap.has(a.name)) {
-                assetMap.set(a.name, a);
-            } else {
-                // Update URL if file exists and current doesn't have URL
-                const existing = assetMap.get(a.name);
-                if (!existing.url && a.url) {
+        // Use a canonical key to avoid duplicates between display names vs sanitized filenames.
+        const assetMap = new Map(); // canonicalKey -> asset
+
+        function upsertAsset(incoming, { isHighestPriorityUrl = false } = {}) {
+            if (!incoming || typeof incoming.name !== 'string') return;
+            const key = getCanonicalAssetKey(incoming.name);
+            const existing = assetMap.get(key);
+
+            if (!existing) {
+                assetMap.set(key, { ...incoming });
+                return;
+            }
+
+            // Preserve the existing display name (what user uses in %%img:...%%)
+            const displayName = existing.name;
+
+            // Merge tags conservatively
+            const tags = existing.tags || incoming.tags || [];
+
+            // Merge location; user/images should override user/files
+            const urlToUse = isHighestPriorityUrl
+                ? (incoming.url || existing.url)
+                : (existing.url || incoming.url);
+
+            assetMap.set(key, {
+                ...existing,
+                ...incoming,
+                name: displayName,
+                tags,
+                url: urlToUse,
+                filename: incoming.filename || existing.filename,
+                path: incoming.path || existing.path,
+                isImageDir: existing.isImageDir || incoming.isImageDir,
+            });
+        }
+
+        // 1) Metadata first (defines display names + tags)
+        assets.forEach((a) => upsertAsset(a));
+
+        // 2) user/files listing (fills URLs if missing)
+        fileAssets.forEach((a) => upsertAsset(a));
+
+        // 3) user/images listing (highest priority URL)
+        userImagesAssets.forEach((a) => upsertAsset(a, { isHighestPriorityUrl: true }));
+
+        assets = Array.from(assetMap.values());
+
+        // Auto-sync discovered file assets into metadata (and dedupe existing metadata by canonical key).
+        // This prevents:
+        // - "counted but not rendered" (renderer indexes into metadata)
+        // - metadata growth from duplicate names after repeated migrations/imports
+        try {
+            const rawAssetsBefore = ContextUtil.getAssetsRaw(character) || [];
+            const byKey = new Map();
+            let changed = false;
+
+            rawAssetsBefore.forEach((a) => {
+                if (!a || typeof a.name !== 'string') return;
+                const key = getCanonicalAssetKey(a.name);
+                if (!byKey.has(key)) {
+                    byKey.set(key, { ...a });
+                } else {
+                    // Deduplicate existing metadata entries: keep the first display name, merge tags/locations.
+                    const existing = byKey.get(key);
+                    const mergedTags = Array.from(new Set([...(existing.tags || []), ...(a.tags || [])]));
+                    byKey.set(key, {
+                        ...existing,
+                        url: existing.url || a.url,
+                        filename: existing.filename || a.filename,
+                        path: existing.path || a.path,
+                        isImageDir: existing.isImageDir || a.isImageDir,
+                        tags: mergedTags,
+                    });
+                    changed = true;
+                }
+            });
+
+            for (const a of assets) {
+                if (!a || typeof a.name !== 'string' || a.name.trim() === '') continue;
+                const key = getCanonicalAssetKey(a.name);
+                const existing = byKey.get(key);
+
+                if (!existing) {
+                    if (a.url || a.filename || a.path) {
+                        byKey.set(key, {
+                            name: a.name,
+                            filename: a.filename || null,
+                            path: a.path || a.filename || null,
+                            url: a.url || null,
+                            tags: a.tags || [],
+                            isImageDir: !!a.isImageDir,
+                        });
+                        changed = true;
+                    }
+                    continue;
+                }
+
+                // Merge best-known location into existing metadata; preserve display name + tags
+                if (a.url && existing.url !== a.url) {
                     existing.url = a.url;
+                    changed = true;
+                }
+                if (a.filename && existing.filename !== a.filename) {
                     existing.filename = a.filename;
+                    changed = true;
+                }
+                if (a.path && existing.path !== a.path) {
                     existing.path = a.path;
+                    changed = true;
+                }
+                if (a.isImageDir && !existing.isImageDir) {
+                    existing.isImageDir = true;
+                    changed = true;
+                }
+
+                // Avoid accidental tag loss
+                if (a.tags && a.tags.length > 0 && (!existing.tags || existing.tags.length === 0)) {
+                    existing.tags = a.tags;
+                    changed = true;
                 }
             }
-        });
-        
-        // Finally, add/update from user/images/ (highest priority for URL)
-        userImagesAssets.forEach(a => {
-            if (!assetMap.has(a.name)) {
-                assetMap.set(a.name, a);
-            } else {
-                // user/images/ takes priority - update URL
-                const existing = assetMap.get(a.name);
-                existing.url = a.url;
-                existing.filename = a.filename;
-                existing.path = a.path;
-                existing.isImageDir = true;
+
+            if (changed) {
+                const deduped = Array.from(byKey.values());
+                await ContextUtil.saveAssets(getContext().characterId, deduped);
+                invalidateAssetCache();
+                assets = deduped;
             }
-        });
-        
-        assets = Array.from(assetMap.values());
+        } catch (e) {
+            log('Auto-sync/dedupe of discovered assets into metadata failed:', e.message);
+        }
         
         const activeFilterTags = new Set(Array.from(popupContainer.querySelectorAll('.tag-filter.active')).map(el => el.dataset.tag));
         
@@ -4102,8 +4640,9 @@ If there are variations in numbers, do not use them consecutively.`;
             itemsContainer.className = 'inline-assets-group-items';
             
             groupAssets.forEach(asset => {
-                // Find index by name instead of reference (more reliable)
-                const assetIndex = rawAssets.findIndex(a => a.name === asset.name);
+                // Find index by name or canonical key (handles display-name vs sanitized-filename mismatches)
+                const assetKey = getCanonicalAssetKey(asset.name);
+                const assetIndex = rawAssets.findIndex(a => a.name === asset.name || getCanonicalAssetKey(a.name) === assetKey);
                 
                 if (assetIndex === -1) {
                     console.warn('[InlineImageAssets] Asset not found in raw assets:', asset.name);

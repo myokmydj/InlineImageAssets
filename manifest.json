@@ -1,9 +1,9 @@
 {
     "name": "Inline Image Assets",
     "display_name": "Inline Image Assets + Performance Booster",
-    "description": "File system based image asset manager with charx support and persona assets. Stores images in user/files/ for both characters and personas. Includes bulk delete, migration from base64, and CSS containment optimization. AI can use both character and persona assets with %%img:name%% tags.",
+    "description": "File system based image asset manager with charx support and persona assets. Prefers per-character folders under user/images/{characterName}/ via SillyTavern Images API, with fallback to user/files/ when unavailable. Includes bulk delete, ZIP download, migration from legacy base64 and legacy user/files layout, and performance optimizations. Use %%img:name%% tags in chat.",
     "author": "User-inspired",
-    "version": "5.1.0",
+    "version": "5.2.0",
     "loading_order": 5,
     "js": "index.js",
     "css": "style.css",

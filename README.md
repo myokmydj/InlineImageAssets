@@ -8,8 +8,9 @@ A powerful SillyTavern extension for managing and displaying inline image assets
 
 **Inline Image Assets** transforms how you manage and display character images in SillyTavern. Instead of embedding large base64 data in character cards, this extension stores images as separate files, dramatically improving performance and enabling features like:
 
-- Display character and persona expressions and poses inline within chat messages
+- Display character expressions and poses inline within chat messages
 - Manage thousands of assets without lag or memory issues
+- Seamless integration with charx character format
 - AI-friendly asset prompts for automatic image insertion
 
 ---
@@ -23,7 +24,8 @@ A powerful SillyTavern extension for managing and displaying inline image assets
 - Zero lag or delay during uploads
 
 ### 🚀 Local File-Based Architecture
-- Images stored in `user/files/`
+- Preferred storage: `user/images/{characterName}/` (per-character folders)
+- Fallback storage (older SillyTavern builds): `user/files/` (flat structure with prefix)
 - No base64 bloat in character cards
 - Instant loading with browser-native caching
 
@@ -32,6 +34,7 @@ A powerful SillyTavern extension for managing and displaying inline image assets
 - Multi-select deletion with checkbox mode
 - Bulk download all assets as ZIP
 - One-click migration from legacy base64 format
+- One-click migration from legacy `user/files` layout → per-character folders
 
 ### 🎯 Performance Optimizations
 - CSS containment for smooth scrolling
@@ -90,15 +93,24 @@ Insert images in AI responses using the tag format:
 
 The tag will be automatically replaced with the corresponding image.
 
+### Persona Assets (Optional)
+
+This extension also supports **Persona assets** as a fallback when a character asset is not found.
+
+- Open the **Persona** panel and click the **Inline Image Assets** persona button (added near other persona controls).
+- Upload/manage persona images there.
+- In chat, use the same tag format: `%%img:assetname%%`
+	- Resolution order: **Character assets first**, then **Persona assets**.
+
 ### Generating AI Prompts
 
 1. Click the **📄 Copy Asset List** button
-2. Paste the generated prompt into your character's WI (It's good works for AN^)
+2. Paste the generated prompt into your character's description or system prompt
 3. The AI will know which images are available and how to use them
 
 **Generated Prompt Example:**
 ```
-### {{char}}'s (or {{user}}'s) Image Asset Usage Guide
+### {{char}}'s Image Asset Usage Guide
 
 **Available Image Filenames:**
 "smile", "happy", "sad", "angry_[1, 2, 3]"
@@ -154,8 +166,9 @@ Use the tag `%%img:filename%%` in your response.
 **A:** No. The Performance Booster component is always active and actually improves scrolling performance. Asset rendering only activates when a character has registered assets.
 
 ### Q: Where are the images stored?
-**A:** Images are stored in possible location:
-- `data/default-user/files/` (flat structure with prefix)
+**A:** It depends on your SillyTavern build:
+- Preferred: `data/default-user/images/{characterName}/` (served as `/user/images/{characterName}/...`)
+- Fallback: `data/default-user/files/` (served as `/user/files/...`, flat structure with prefix)
 
 ### Q: Do assets transfer when sharing character cards?
 **A:** The asset metadata is stored in the character card, but the actual image files need to be shared separately. Use the ZIP download feature to package all assets.
@@ -170,6 +183,68 @@ Use the tag `%%img:filename%%` in your response.
 ### Images not displaying in chat
 
 1. **Check asset registration:** Open Asset Manager and verify the asset exists
-2. **Verify file exists:** Check if the file is in `user/files/`
+2. **Verify file exists:** Check `user/images/{characterName}/` first, then `user/files/` (fallback)
 3. **Check tag format:** Ensure you're using `%%img:name%%` without file extension
 4. **Case sensitivity:** Try matching the exact case of the asset name
+
+### Upload fails with 403 error
+
+This is usually a CSRF token issue:
+1. Refresh the SillyTavern page
+2. Try uploading again
+3. If persistent, check browser console for detailed errors
+
+### Assets not found after import
+
+1. Click the **🔄 Refresh** button in Asset Manager
+2. Check if files exist in the expected directory (`user/images/{characterName}/` or fallback `user/files/`)
+3. If you are on an older SillyTavern build without the Images API, assets will remain in `user/files/`
+
+### Performance issues with many assets
+
+1. Ensure you're using the latest version (5.0.0+)
+2. Close and reopen the Asset Manager popup
+3. Check browser memory usage in Task Manager
+4. Consider using WebP format for smaller file sizes
+
+---
+
+## 📋 Changelog
+
+### Version 5.2.0 (Current) — 2025-12-12
+- 📁 Preferred per-character storage via SillyTavern Images API (`/api/images/*`) into `user/images/{characterName}/`
+- 🔁 Fallback to legacy `user/files/` when Images API is unavailable
+- 🧭 Listing/scanning now uses `/api/images/list` first for reliable discovery
+- 🧳 Migration tools:
+	- legacy base64 → files/images
+	- legacy `user/files` flat layout → per-character folders
+- 🧩 Better name/path compatibility (canonical matching + dedupe) to prevent duplicate assets and reduce memory blowups
+- 👤 Persona asset manager button + persona asset fallback support in `%%img:...%%` resolution
+
+### Version 5.0.0
+- 🚀 Complete rewrite with file-based storage
+- ⚡ Ultra-fast parallel uploads (2,000 files in <10 seconds)
+- 🎯 Global Performance Booster (always active)
+- 📁 Folder-based asset grouping in UI
+- ☑️ Multi-select deletion mode
+- 📦 ZIP download feature
+- 🔍 Auto-scan user/images/ directory
+- 🌐 Unicode character name support
+- 🔄 Legacy base64 migration tool
+
+### Version 4.x
+- Added charx asset import
+- Improved tag filtering
+- Performance optimizations
+
+### Version 3.x
+- Initial file-based storage
+- Basic asset management UI
+
+### Version 2.x
+- Base64 embedded storage
+- Simple tag system
+
+### Version 1.x
+- Initial release
+- Basic inline image display
