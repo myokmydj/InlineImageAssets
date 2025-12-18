@@ -10,6 +10,7 @@ A powerful SillyTavern extension for managing and displaying inline image assets
 
 - Display character expressions and poses inline within chat messages
 - Manage thousands of assets without lag or memory issues
+- Seamless integration with charx character format
 - AI-friendly asset prompts for automatic image insertion
 
 ---
@@ -92,6 +93,174 @@ Insert images in AI responses using the tag format:
 
 The tag will be automatically replaced with the corresponding image.
 
+---
+
+## 🧩 Custom Macros (Extension Asset URLs)
+
+한국어 가이드: [MACROS_KO.md](MACROS_KO.md)
+
+This extension also provides a **SillyTavern-style macro resolver** compatible with the convention:
+
+```
+{{macroName::parameter}}
+```
+
+These macros are designed to let SillyTavern HTML/JS/CSS (or scripts executed by other extensions like JS-Slash-Runner) reference files **bundled inside this extension folder** (images, CSS, JS, HTML, media files).
+
+How it works:
+
+- **Path macros** resolve to the extension’s own static-serving URL (derived from `import.meta.url`). This is cross-platform and works on Windows/Mac/Linux.
+- **Existence checks** are done with `HEAD`/`GET` requests.
+- **File listing** cannot be done from the browser, so `{{iaListFiles::...}}` uses a generated `assets.index.json` by default.
+- If your SillyTavern build mounts extension backend routes, the macros will automatically prefer the backend for listing/MIME/caching.
+
+### Provided Macros
+
+Recommended (single unified macro):
+
+- `{{ia:img:path}}` → URL for an image file inside this extension
+- `{{ia:css:path}}` → URL for a CSS file inside this extension
+- `{{ia:js:path}}` → URL for a JavaScript file inside this extension
+- `{{ia:html:path}}` → URL for an HTML file inside this extension
+- `{{ia:list:dir|recursive=1|ext=png,jpg|format=json}}` → JSON string or newline list
+
+Chat asset shorthand (by name, not path):
+
+- `{{ia:smile}}` → resolves `smile` using this extension’s **character assets first**, then **persona assets**
+- `{{ia:char:smile}}` → character-only
+- `{{ia:user:smile}}` / `{{ia:persona:smile}}` → persona-only
+
+Random pick by prefix:
+
+- `{{ia:rand:card_|scope=char}}` → randomly picks a character asset whose name starts with `card_`
+- Options: `scope=char|user|persona|both`, `prefer=char|user`, `seed=...`, `mode=abs|rel`, `fallback=...`
+
+Random pick from ALL assets (no prefix):
+
+- `{{ia:randAll:scope=both}}` → randomly picks from all available character+persona assets
+- Options: `scope=char|user|persona|both`, `prefer=char|user`, `seed=...`, `mode=abs|rel`, `fallback=...`
+
+Prefix delimiter support:
+
+- `{{ia:rand:alice}}` matches `alice_...`, `alice-...`, `alice....` (and exact `alice`).
+- If you include a delimiter explicitly (e.g. `card_`), it behaves as a plain `startsWith`.
+
+Design helper macros (generate HTML/CSS snippets):
+
+- `{{ia:imgTag:smile|scope=char|class=inline-asset-image|alt=Smile}}` → `<img ...>`
+- `{{ia:bgUrl:smile|scope=char}}` → `url("...")`
+- `{{ia:bgStyle:smile|scope=char}}` → `background-image:url("...");`
+- `{{ia:cssLink:style.css}}` → `<link rel="stylesheet" href="...">`
+- `{{ia:jsModule:some.js}}` → `<script type="module" src="..."></script>`
+
+Compatibility (legacy, still supported):
+
+- `{{iaImagePath::path}}`
+- `{{iaCssPath::path}}`
+- `{{iaJsPath::path}}`
+- `{{iaHtmlPath::path}}`
+- `{{iaListFiles::dir|recursive=1|ext=png,jpg|format=json}}`
+
+### Options (Pipe Syntax)
+
+Options are appended with `|key=value`:
+
+- `mode=abs` (default): absolute-from-origin URL (starts with `/...`)
+- `mode=rel`: relative URL (no leading slash)
+- `fallback=...`: used when the file does not exist or path is rejected
+
+For chat-asset shorthand (`{{ia:smile}}`), you can also use:
+
+- `prefer=char|user` (default `char`) when both scopes are allowed
+
+**Input path forms supported:**
+
+- Relative: `images/logo.png`
+- Absolute-from-origin (must be inside this extension): `/.../InlineImageAssets/images/logo.png`
+- Full URL (must be same-origin and inside this extension): `https://your-host/.../InlineImageAssets/images/logo.png`
+
+### Usage Example (Async)
+
+These macros resolve **asynchronously** to avoid blocking the UI.
+
+```js
+const html = await window.inlineImageAssetsMacros.resolve(
+	`<img src="{{ia:img:images/logo.png|fallback=/user/files/placeholder.png}}">`
+);
+document.querySelector('#somewhere').innerHTML = html;
+```
+
+### Using inside inline CSS (background-image)
+
+**Do not** pass a Windows filesystem path like `C:\\Users\\...` into a macro. Browsers cannot load local disk paths, and the macro sanitizer rejects them for security.
+
+Instead, resolve to a web URL and use it in `url(...)`:
+
+```js
+const html = await window.inlineImageAssetsMacros.resolveWithTavernHelper(
+	`<div class="card-image" style="background-image:url('{{ia:char:card_00_fool}}');"></div>`
+);
+document.querySelector('#somewhere').innerHTML = html;
+```
+
+### Random card_ image (character assets)
+
+```js
+const html = await window.inlineImageAssetsMacros.resolveWithTavernHelper(
+	`<div class="card-image" style="background-image:url('{{ia:rand:card_|scope=char}}');"></div>`
+);
+document.querySelector('#somewhere').innerHTML = html;
+```
+
+If you want deterministic randomness per message, provide a seed (you can use Tavern-Helper macros as seed):
+
+```js
+const html = await window.inlineImageAssetsMacros.resolveWithTavernHelper(
+	`<div class="card-image" style="background-image:url('{{ia:rand:card_|scope=char|seed={{lastMessageId}}}}');"></div>`
+);
+```
+
+### Using with JS-Slash-Runner / Tavern-Helper macros
+
+JS-Slash-Runner (Tavern-Helper) provides built-in macros like `{{userAvatarPath}}` and `{{charAvatarPath}}`.
+To use both systems together:
+
+```js
+const mixed = `
+	<img src="{{userAvatarPath}}">
+	<img src="{{iaImagePath::assets/logo.png|fallback=/user/files/placeholder.png}}">
+`;
+
+const html = await window.inlineImageAssetsMacros.resolveWithTavernHelper(mixed);
+document.querySelector('#somewhere').innerHTML = html;
+```
+
+### Directory Listing Example
+
+```js
+const json = await window.inlineImageAssetsMacros.resolve(
+	`{{iaListFiles::templates|recursive=1|ext=png,jpg|format=json}}`
+);
+const entries = JSON.parse(json);
+console.log(entries);
+```
+
+### Generating `assets.index.json`
+
+After adding/removing assets inside this extension folder, regenerate the index:
+
+```bash
+cd "<your SillyTavern>/data/default-user/extensions/InlineImageAssets"
+node tools/build-assets-index.mjs
+```
+
+### Security Notes
+
+- Paths are sanitized on the client and validated again on the backend.
+- Directory traversal (`..`) and absolute paths are rejected.
+- Only files under this extension directory can be served/listed.
+
+
 ### Persona Assets (Optional)
 
 This extension also supports **Persona assets** as a fallback when a character asset is not found.
@@ -104,7 +273,7 @@ This extension also supports **Persona assets** as a fallback when a character a
 ### Generating AI Prompts
 
 1. Click the **📄 Copy Asset List** button
-2. Paste the generated prompt into your character's WI (It's good work for AN↑)
+2. Paste the generated prompt into your character's description or system prompt
 3. The AI will know which images are available and how to use them
 
 **Generated Prompt Example:**
@@ -232,6 +401,7 @@ This is usually a CSRF token issue:
 - 🔄 Legacy base64 migration tool
 
 ### Version 4.x
+- Added charx asset import
 - Improved tag filtering
 - Performance optimizations
 

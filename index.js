@@ -8,6 +8,970 @@ import { eventSource, event_types } from "../../../../script.js";
         if (DEBUG) console.log(`[InlineImageAssets:DEBUG] ${message}`, ...args);
     };
 
+    // =====================================================================
+    //  InlineImageAssets Custom Macro System (v1)
+    //
+    //  Goal:
+    //  - Provide SillyTavern-style macros: {{macroName::parameter}}
+    //  - Resolve extension-bundled asset URLs (images/css/js/html/media)
+    //  - Support async resolution (no UI blocking) + caching
+    //  - Mitigate path injection & traversal (handled again on backend)
+    //
+    //  IMPORTANT:
+    //  - Browser extensions cannot list/read local files directly.
+    //  - For existence checks + directory listing + correct Content-Type,
+    //    this relies on backend routes mounted by this extension's server.
+    //    (see server.js)
+    // =====================================================================
+
+    // Backend API base (optional).
+    // Some SillyTavern deployments/extensions support mounting backend routes; many don't.
+    // This macro system works without a backend by using SillyTavern's static file serving
+    // for extension files and by reading a generated assets index for directory listing.
+    const IIA_API_BASE = '/api/extensions/inline-image-assets';
+
+    // Extension base URL (static-serving path). This is the most reliable, cross-platform way
+    // to reference assets bundled inside this extension folder.
+    // Example: if this file is served from /scripts/extensions/InlineImageAssets/index.js
+    // then extensionBaseUrl.pathname ends with /scripts/extensions/InlineImageAssets/
+    const extensionBaseUrl = new URL('.', import.meta.url);
+    const extensionBasePath = extensionBaseUrl.pathname.endsWith('/')
+        ? extensionBaseUrl.pathname
+        : `${extensionBaseUrl.pathname}/`;
+
+    const ASSETS_INDEX_FILENAME = 'assets.index.json';
+
+    // Supported file extensions by category (used for validation + hints)
+    const IIA_EXT = {
+        image: new Set(['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'bmp', 'ico']),
+        css: new Set(['css']),
+        js: new Set(['js', 'mjs']),
+        html: new Set(['html', 'htm']),
+        media: new Set(['mp3', 'wav', 'ogg', 'mp4', 'webm']),
+    };
+
+    // Cache: inputPath -> { ok, url, error, ts }
+    const macroResolveCache = new Map();
+    const MACRO_CACHE_TTL_MS = 30_000;
+
+    // Cache: listKey -> { ok, entries, ts }
+    const macroListCache = new Map();
+    const LIST_CACHE_TTL_MS = 10_000;
+
+    // Cache: random candidate lists (prefix -> urls) to avoid rebuilding maps too often
+    const macroRandomCandidatesCache = new Map();
+    const RANDOM_CANDIDATES_TTL_MS = 5_000;
+
+    function macroLog(message, ...args) {
+        console.log(`[InlineImageAssets:macro] ${message}`, ...args);
+    }
+
+    function macroWarn(message, ...args) {
+        console.warn(`[InlineImageAssets:macro] ${message}`, ...args);
+    }
+
+    function macroError(message, ...args) {
+        console.error(`[InlineImageAssets:macro] ${message}`, ...args);
+    }
+
+    /**
+     * Parses a "|"-option list.
+     * Example: "images/a.png|mode=rel|fallback=/user/files/x.png"
+     * - First segment is treated as the main value unless key=value.
+     */
+    function parsePipeOptions(param) {
+        const raw = (param ?? '').toString();
+        const parts = raw.split('|').map(p => p.trim()).filter(Boolean);
+        const opts = {};
+        let main = '';
+        for (const part of parts) {
+            const eq = part.indexOf('=');
+            if (eq > 0) {
+                const k = part.slice(0, eq).trim();
+                const v = part.slice(eq + 1).trim();
+                if (k) opts[k] = v;
+            } else if (!main) {
+                main = part;
+            }
+        }
+        return { main, opts };
+    }
+
+    /**
+     * Normalizes user-provided relative paths to a safe, consistent form.
+     * This is a *client-side* sanitization. Backend performs authoritative checks.
+     */
+    function normalizeMacroPath(inputPath) {
+        const raw = (inputPath ?? '').toString().replace(/\0/g, '').trim();
+        // Convert backslashes to forward slashes for cross-platform consistency
+        let p = raw.replace(/\\+/g, '/');
+
+        // Accept absolute URLs/paths *only* if they point inside this extension base.
+        // Examples accepted:
+        // - /scripts/extensions/InlineImageAssets/assets/logo.png
+        // - https://host/scripts/extensions/InlineImageAssets/assets/logo.png
+        try {
+            if (/^https?:\/\//i.test(p)) {
+                const u = new URL(p);
+                // Only allow same-origin absolute URLs
+                if (u.origin !== window.location.origin) {
+                    return { ok: false, error: 'Cross-origin URLs are not allowed' };
+                }
+                p = u.pathname.replace(/\\+/g, '/');
+            }
+
+            // If it's an absolute-from-origin path, strip the extension base path.
+            if (p.startsWith(extensionBasePath)) {
+                p = p.substring(extensionBasePath.length);
+            }
+        } catch {
+            // Ignore URL parse errors and fall back to raw string validation.
+        }
+
+        // Remove leading slashes so it stays "relative"
+        p = p.replace(/^\/+/, '');
+        // Block traversal segments
+        const segments = p.split('/').filter(Boolean);
+        if (segments.some(s => s === '..' || s === '.')) {
+            return { ok: false, error: 'Path traversal is not allowed' };
+        }
+        // Block obvious absolute paths (Windows drive) and UNC-like
+        if (/^[a-zA-Z]:\//.test(p) || p.startsWith('\\\\')) {
+            return { ok: false, error: 'Absolute paths are not allowed' };
+        }
+        return { ok: true, path: segments.join('/') };
+    }
+
+    function getExtensionLower(p) {
+        const idx = p.lastIndexOf('.');
+        if (idx < 0) return '';
+        return p.slice(idx + 1).toLowerCase();
+    }
+
+    function isExtensionAllowed(kind, p) {
+        const ext = getExtensionLower(p);
+        if (!ext) return true; // allow extension-less (caller may use folders)
+        const allow = IIA_EXT[kind];
+        if (!allow) return true;
+        return allow.has(ext);
+    }
+
+    function buildStaticAssetUrl(relPath, mode) {
+        // Build a URL that points to a file inside this extension folder.
+        // Note: new URL(rel, base) will normalize but will also allow '../' -
+        // we prevent traversal earlier via normalizeMacroPath.
+        const url = new URL(relPath, extensionBaseUrl);
+        const absFromOrigin = url.pathname + url.search + url.hash;
+        if (String(mode).toLowerCase() === 'rel') {
+            return absFromOrigin.replace(/^\//, '');
+        }
+        return absFromOrigin;
+    }
+
+    function buildBackendFileUrl(relPath, mode) {
+        const url = `${IIA_API_BASE}/file?path=${encodeURIComponent(relPath)}`;
+        if (String(mode).toLowerCase() === 'rel') {
+            return url.replace(/^\//, '');
+        }
+        return url;
+    }
+
+    // Backend availability cache
+    let backendAvailable = null; // null unknown, true/false known
+    let backendCheckedAt = 0;
+    const BACKEND_CHECK_TTL_MS = 30_000;
+
+    async function isBackendAvailable() {
+        const now = Date.now();
+        if (backendAvailable !== null && (now - backendCheckedAt) < BACKEND_CHECK_TTL_MS) {
+            return backendAvailable;
+        }
+
+        backendCheckedAt = now;
+        try {
+            // A cheap probe. If it 404s, backend is not mounted.
+            const probeUrl = `${IIA_API_BASE}/stat?path=${encodeURIComponent('manifest.json')}`;
+            const res = await fetch(probeUrl, { method: 'GET' });
+            backendAvailable = res.ok;
+        } catch (err) {
+            backendAvailable = false;
+        }
+        if (!backendAvailable) {
+            macroLog('Backend routes not detected; using static asset URLs + assets index for listing.');
+        }
+        return backendAvailable;
+    }
+
+    async function statPathBackend(relPath) {
+        const url = `${IIA_API_BASE}/stat?path=${encodeURIComponent(relPath)}`;
+        const res = await fetch(url, { method: 'GET' });
+        if (!res.ok) {
+            return { ok: false, error: `Not found (${res.status})` };
+        }
+        return res.json();
+    }
+
+    async function statPathStatic(relPath) {
+        // Try HEAD first (fast). Some servers may not support HEAD; fallback to GET.
+        const url = buildStaticAssetUrl(relPath, 'abs');
+        try {
+            const head = await fetch(url, { method: 'HEAD' });
+            if (!head.ok) return { ok: false, error: `Not found (${head.status})` };
+            const ct = head.headers.get('Content-Type') || '';
+            return { ok: true, relPath, mime: ct };
+        } catch (err) {
+            try {
+                const get = await fetch(url, { method: 'GET' });
+                if (!get.ok) return { ok: false, error: `Not found (${get.status})` };
+                const ct = get.headers.get('Content-Type') || '';
+                // Don't consume body; just return meta.
+                return { ok: true, relPath, mime: ct };
+            } catch (err2) {
+                return { ok: false, error: 'Fetch failed' };
+            }
+        }
+    }
+
+    /**
+     * Resolves an extension asset path macro to a usable URL.
+     * Includes existence checks (cached).
+     */
+    async function resolveAssetPath(kind, param) {
+        const { main, opts } = parsePipeOptions(param);
+        const mode = opts.mode || 'abs';
+        const fallback = opts.fallback || '';
+
+        const normalized = normalizeMacroPath(main);
+        if (!normalized.ok) {
+            macroWarn(`Rejected path: ${main} (${normalized.error})`);
+            return fallback || `[InlineImageAssets] Invalid path: ${normalized.error}`;
+        }
+
+        const relPath = normalized.path;
+        if (!isExtensionAllowed(kind, relPath)) {
+            macroWarn(`Extension not allowed for kind=${kind}: ${relPath}`);
+            return fallback || `[InlineImageAssets] Unsupported extension for ${kind}: ${relPath}`;
+        }
+
+        const cacheKey = `${kind}::${mode}::${relPath}::${fallback}`;
+        const now = Date.now();
+        const cached = macroResolveCache.get(cacheKey);
+        if (cached && (now - cached.ts) < MACRO_CACHE_TTL_MS) {
+            return cached.value;
+        }
+
+        try {
+            const backendOk = await isBackendAvailable();
+            const meta = backendOk
+                ? await statPathBackend(relPath)
+                : await statPathStatic(relPath);
+
+            if (!meta?.ok) {
+                const msg = meta?.error || 'Not found';
+                macroWarn(`Missing asset: ${relPath} (${msg})`);
+                const value = fallback || `[InlineImageAssets] Missing file: ${relPath}`;
+                macroResolveCache.set(cacheKey, { ts: now, value });
+                return value;
+            }
+
+            const value = backendOk
+                ? buildBackendFileUrl(relPath, mode)
+                : buildStaticAssetUrl(relPath, mode);
+            macroResolveCache.set(cacheKey, { ts: now, value });
+            return value;
+        } catch (err) {
+            macroError(`resolveAssetPath failed for ${relPath}`, err);
+            const value = fallback || `[InlineImageAssets] Error resolving: ${relPath}`;
+            macroResolveCache.set(cacheKey, { ts: now, value });
+            return value;
+        }
+    }
+
+    /**
+     * Lists files under an extension folder (async + cached).
+     * Macro syntax:
+     *   {{iaListFiles::templates|recursive=1|ext=png,jpg|format=json}}
+     * format:
+     *   - json (default): JSON string of entries
+     *   - lines: newline-separated relPath
+     */
+    async function resolveListFiles(param) {
+        const { main, opts } = parsePipeOptions(param);
+        const dir = opts.dir || main || '';
+        const recursive = String(opts.recursive || '0') === '1';
+        const ext = (opts.ext || '').toString().trim();
+        const format = (opts.format || 'json').toString().toLowerCase();
+
+        const normalized = normalizeMacroPath(dir || '');
+        if (dir && !normalized.ok) {
+            macroWarn(`Rejected list dir: ${dir} (${normalized.error})`);
+            return `[]`;
+        }
+        const safeDir = normalized.ok ? normalized.path : '';
+
+        const cacheKey = `${safeDir}::${recursive}::${ext}::${format}`;
+        const now = Date.now();
+        const cached = macroListCache.get(cacheKey);
+        if (cached && (now - cached.ts) < LIST_CACHE_TTL_MS) {
+            return cached.value;
+        }
+
+        try {
+            const backendOk = await isBackendAvailable();
+            let entries = [];
+
+            if (backendOk) {
+                const url = new URL(`${IIA_API_BASE}/list`, window.location.origin);
+                url.searchParams.set('dir', safeDir);
+                url.searchParams.set('recursive', recursive ? '1' : '0');
+                if (ext) url.searchParams.set('ext', ext);
+                const res = await fetch(url.toString(), { method: 'GET' });
+                if (!res.ok) {
+                    macroWarn(`Backend list failed: ${res.status}`);
+                    entries = [];
+                } else {
+                    const data = await res.json();
+                    entries = Array.isArray(data?.entries) ? data.entries : [];
+                }
+            } else {
+                // No backend: use a generated assets index JSON bundled with the extension.
+                // This is the only safe way to "list" without server-side directory access.
+                const idxUrl = new URL(ASSETS_INDEX_FILENAME, extensionBaseUrl);
+                const res = await fetch(idxUrl.toString(), { method: 'GET' });
+                if (!res.ok) {
+                    macroWarn(`assets.index.json missing/unreadable (${res.status}). Run the generator.`);
+                    entries = [];
+                } else {
+                    const data = await res.json();
+                    entries = Array.isArray(data?.entries) ? data.entries : (Array.isArray(data) ? data : []);
+                }
+
+                // Filter by dir prefix
+                if (safeDir) {
+                    const prefix = safeDir.endsWith('/') ? safeDir : `${safeDir}/`;
+                    entries = entries.filter(e => {
+                        const rel = typeof e === 'string' ? e : e.relPath;
+                        return typeof rel === 'string' && (rel === safeDir || rel.startsWith(prefix));
+                    });
+                }
+
+                // Filter by ext list
+                if (ext) {
+                    const allow = new Set(ext.split(',').map(s => s.trim().toLowerCase()).filter(Boolean));
+                    entries = entries.filter(e => {
+                        const rel = typeof e === 'string' ? e : e.relPath;
+                        const ex = getExtensionLower(rel);
+                        return allow.has(ex);
+                    });
+                }
+
+                // If recursive=0, only return direct children
+                if (!recursive && safeDir) {
+                    const basePrefix = safeDir.endsWith('/') ? safeDir : `${safeDir}/`;
+                    entries = entries.filter(e => {
+                        const rel = typeof e === 'string' ? e : e.relPath;
+                        const rest = rel.substring(basePrefix.length);
+                        return rest && !rest.includes('/');
+                    });
+                }
+
+                // Normalize to objects when returning JSON
+                if (format !== 'lines') {
+                    entries = entries.map(e => (typeof e === 'string') ? ({ relPath: e }) : e);
+                }
+            }
+
+            let value;
+            if (format === 'lines') {
+                value = entries.map(e => (typeof e === 'string') ? e : e.relPath).join('\n');
+            } else {
+                value = JSON.stringify(entries);
+            }
+            macroListCache.set(cacheKey, { ts: now, value });
+            return value;
+        } catch (err) {
+            macroError('resolveListFiles failed', err);
+            const value = '[]';
+            macroListCache.set(cacheKey, { ts: now, value });
+            return value;
+        }
+    }
+
+    /**
+     * Resolves a character/persona ("user") asset NAME (not a path) into a usable URL.
+     *
+     * Keys / scopes:
+     * - default: character first, then persona fallback (matches %%img:...%% behavior)
+     * - char: character-only
+     * - user/persona: persona-only
+     *
+     * Options (pipe):
+     * - mode=abs|rel (default abs)
+     * - prefer=char|user (default char) (only when scope=both)
+     * - fallback=...
+     */
+    async function resolveChatAssetUrl(nameParam, { scope = 'both' } = {}) {
+        const { main, opts } = parsePipeOptions(nameParam);
+        const mode = (opts.mode || 'abs').toString();
+        const fallback = (opts.fallback || '').toString();
+        const prefer = (opts.prefer || 'char').toString().toLowerCase();
+
+        const assetName = (main || '').toString().trim();
+        if (!assetName) {
+            return fallback || '[InlineImageAssets] Missing asset name';
+        }
+
+        const cacheKey = `chatAsset::${scope}::${prefer}::${mode}::${assetName}::${fallback}`;
+        const now = Date.now();
+        const cached = macroResolveCache.get(cacheKey);
+        if (cached && (now - cached.ts) < MACRO_CACHE_TTL_MS) {
+            return cached.value;
+        }
+
+        try {
+            const context = getContext?.();
+            const character = context?.characters?.[context?.characterId];
+            if (!character) {
+                const value = fallback || '[InlineImageAssets] No character selected';
+                macroResolveCache.set(cacheKey, { ts: now, value });
+                return value;
+            }
+
+            // Build caches (async; will reuse internal caching in the extension)
+            let charCache = new Map();
+            let personaCache = new Map();
+            const personaName = (typeof getCurrentPersonaName === 'function') ? getCurrentPersonaName() : null;
+
+            if ((scope === 'both' || scope === 'char') && typeof buildAssetCache === 'function') {
+                charCache = await buildAssetCache(character, context);
+            }
+            if ((scope === 'both' || scope === 'user' || scope === 'persona') && personaName && typeof buildPersonaAssetCache === 'function') {
+                personaCache = await buildPersonaAssetCache(personaName);
+            }
+
+            function normalizeUrlForMode(url) {
+                if (!url) return url;
+                if (mode.toLowerCase() === 'rel') return url.replace(/^\//, '');
+                return url;
+            }
+
+            // Helper: resolve a name from a cache using the same heuristics as chat rendering.
+            function findInCache(cache, name) {
+                if (!cache || cache.size === 0) return null;
+
+                const trimmedName = name.trim();
+
+                // Support name.ext in macro input (e.g. smile.png)
+                let baseNameFromExt = null;
+                if (trimmedName.includes('.')) {
+                    const lastDot = trimmedName.lastIndexOf('.');
+                    if (lastDot > 0 && lastDot < trimmedName.length - 1) {
+                        const maybeExt = trimmedName.substring(lastDot + 1).toLowerCase();
+                        if (Array.isArray(SUPPORTED_FORMATS) && SUPPORTED_FORMATS.includes(maybeExt)) {
+                            baseNameFromExt = trimmedName.substring(0, lastDot);
+                        }
+                    }
+                }
+
+                const candidates = baseNameFromExt ? [trimmedName, baseNameFromExt] : [trimmedName];
+
+                // Exact match
+                for (const candidate of candidates) {
+                    const v = cache.get(candidate);
+                    if (v) return v;
+                }
+
+                // Sanitized + canonical
+                for (const candidate of candidates) {
+                    const sanitized = (typeof sanitizeFilename === 'function') ? sanitizeFilename(candidate) : candidate;
+                    const v1 = cache.get(sanitized);
+                    if (v1) return v1;
+                    const canonical = (typeof getCanonicalAssetKey === 'function') ? getCanonicalAssetKey(candidate) : candidate;
+                    const v2 = cache.get(canonical);
+                    if (v2) return v2;
+                }
+
+                // Case-insensitive
+                const lower = trimmedName.toLowerCase();
+                for (const [k, v] of cache.entries()) {
+                    if ((k || '').toString().toLowerCase() === lower) return v;
+                }
+
+                return null;
+            }
+
+            // Collision rule: if both scopes are allowed, choose preferred first.
+            const tryCharFirst = (scope === 'char') || (scope === 'both' && prefer !== 'user');
+            let url = null;
+
+            if (tryCharFirst) {
+                url = findInCache(charCache, assetName) || findInCache(personaCache, assetName);
+            } else {
+                url = findInCache(personaCache, assetName) || findInCache(charCache, assetName);
+            }
+
+            // Last resort: direct URL guess (character only)
+            if (!url && character?.name && scope !== 'user' && scope !== 'persona') {
+                url = `/user/images/${character.name}/${assetName}.png`;
+            }
+
+            const value = url ? normalizeUrlForMode(url) : (fallback || `[InlineImageAssets] Missing asset: ${assetName}`);
+            macroResolveCache.set(cacheKey, { ts: now, value });
+            return value;
+        } catch (err) {
+            macroError('resolveChatAssetUrl failed', err);
+            const value = fallback || '[InlineImageAssets] Error resolving chat asset';
+            macroResolveCache.set(cacheKey, { ts: now, value });
+            return value;
+        }
+    }
+
+    function pickRandomIndex(length, seed = '') {
+        if (length <= 1) return 0;
+        // Prefer crypto randomness when available
+        if (!seed && globalThis.crypto?.getRandomValues) {
+            const buf = new Uint32Array(1);
+            globalThis.crypto.getRandomValues(buf);
+            return Number(buf[0] % length);
+        }
+
+        // Deterministic-ish hash for seeded picks
+        const s = (seed ?? '').toString();
+        let h = 2166136261; // FNV-1a 32-bit
+        for (let i = 0; i < s.length; i++) {
+            h ^= s.charCodeAt(i);
+            h = Math.imul(h, 16777619);
+        }
+        return Math.abs(h) % length;
+    }
+
+    function escapeHtmlAttr(value) {
+        return (value ?? '').toString()
+            .replace(/&/g, '&amp;')
+            .replace(/"/g, '&quot;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;');
+    }
+
+    function normalizeUrlForMode(url, mode) {
+        if (!url) return url;
+        if ((mode ?? '').toString().toLowerCase() === 'rel') return url.replace(/^\//, '');
+        return url;
+    }
+
+    function shouldUseRawPrefixMatch(prefixRaw) {
+        // If user explicitly includes a delimiter (e.g. "card_"), treat as raw startsWith.
+        // Otherwise treat prefix as a token: match `prefix` OR `prefix + delimiter`.
+        const p = (prefixRaw ?? '').toString();
+        return /[_.\-\s]$/.test(p);
+    }
+
+    function isPrefixTokenMatch(assetKeyLower, prefixLower, delimsLower) {
+        if (!assetKeyLower || !prefixLower) return false;
+        if (assetKeyLower === prefixLower) return true;
+        for (const d of delimsLower) {
+            if (assetKeyLower.startsWith(prefixLower + d)) return true;
+        }
+        return false;
+    }
+
+    function collectCandidateUrlsFromCache(cache, {
+        mode = 'abs',
+        prefixLower = '',
+        rawStartsWith = false,
+        delimsLower = ['_', '-', '.'],
+    } = {}) {
+        const urlsSet = new Set();
+        if (!cache || cache.size === 0) return urlsSet;
+
+        for (const [k, v] of cache.entries()) {
+            const key = (k ?? '').toString();
+            if (!key) continue;
+            if (typeof v !== 'string' || !v) continue;
+
+            if (prefixLower) {
+                const keyLower = key.toLowerCase();
+                const ok = rawStartsWith
+                    ? keyLower.startsWith(prefixLower)
+                    : isPrefixTokenMatch(keyLower, prefixLower, delimsLower);
+                if (!ok) continue;
+            }
+
+            urlsSet.add(normalizeUrlForMode(v, mode));
+        }
+
+        return urlsSet;
+    }
+
+    /**
+     * Randomly picks a chat asset URL from character/persona caches by prefix.
+     *
+     * Examples:
+     * - {{ia:rand:card_|scope=char}}
+     * - {{ia:rand:card_|scope=both|prefer=char|seed={{lastMessageId}}}}
+     * - {{rand:card_|scope=char}} (alias)
+     */
+    async function resolveChatAssetRandom(prefixParam) {
+        const { main, opts } = parsePipeOptions(prefixParam);
+        const prefixRaw = (main || '').toString().trim();
+        const prefix = prefixRaw;
+        const scope = (opts.scope || 'both').toString().toLowerCase();
+        const prefer = (opts.prefer || 'char').toString().toLowerCase();
+        const mode = (opts.mode || 'abs').toString();
+        const fallback = (opts.fallback || '').toString();
+        const seed = (opts.seed || '').toString();
+
+        if (!prefix) {
+            return fallback || '[InlineImageAssets] Missing prefix for rand';
+        }
+
+        const now = Date.now();
+        const candidatesKey = `rand::${scope}::${prefer}::${mode}::${prefix}`;
+        const cached = macroRandomCandidatesCache.get(candidatesKey);
+        if (cached && (now - cached.ts) < RANDOM_CANDIDATES_TTL_MS) {
+            const urls = cached.urls;
+            if (!urls || urls.length === 0) return fallback || `[InlineImageAssets] No assets match prefix: ${prefix}`;
+            return urls[pickRandomIndex(urls.length, seed)];
+        }
+
+        try {
+            const context = getContext?.();
+            const character = context?.characters?.[context?.characterId];
+            if (!character) {
+                return fallback || '[InlineImageAssets] No character selected';
+            }
+
+            let charCache = new Map();
+            let personaCache = new Map();
+            const personaName = (typeof getCurrentPersonaName === 'function') ? getCurrentPersonaName() : null;
+
+            if ((scope === 'both' || scope === 'char') && typeof buildAssetCache === 'function') {
+                charCache = await buildAssetCache(character, context);
+            }
+            if ((scope === 'both' || scope === 'user' || scope === 'persona') && personaName && typeof buildPersonaAssetCache === 'function') {
+                personaCache = await buildPersonaAssetCache(personaName);
+            }
+
+            const prefixLower = prefix.toLowerCase();
+            const rawStartsWith = shouldUseRawPrefixMatch(prefix);
+            const delimsLower = ['_', '-', '.'];
+            const urlsSet = new Set();
+
+            const tryCharFirst = (scope === 'char') || (scope === 'both' && prefer !== 'user');
+            if (tryCharFirst) {
+                for (const u of collectCandidateUrlsFromCache(charCache, { mode, prefixLower, rawStartsWith, delimsLower })) urlsSet.add(u);
+                for (const u of collectCandidateUrlsFromCache(personaCache, { mode, prefixLower, rawStartsWith, delimsLower })) urlsSet.add(u);
+            } else {
+                for (const u of collectCandidateUrlsFromCache(personaCache, { mode, prefixLower, rawStartsWith, delimsLower })) urlsSet.add(u);
+                for (const u of collectCandidateUrlsFromCache(charCache, { mode, prefixLower, rawStartsWith, delimsLower })) urlsSet.add(u);
+            }
+
+            const normalizedUrls = Array.from(urlsSet);
+
+            macroRandomCandidatesCache.set(candidatesKey, { ts: now, urls: normalizedUrls });
+
+            if (normalizedUrls.length === 0) {
+                return fallback || `[InlineImageAssets] No assets match prefix: ${prefix}`;
+            }
+            return normalizedUrls[pickRandomIndex(normalizedUrls.length, seed)];
+        } catch (err) {
+            macroError('resolveChatAssetRandom failed', err);
+            return fallback || '[InlineImageAssets] Error resolving rand asset';
+        }
+    }
+
+    /**
+     * Randomly picks a chat asset URL from ALL available character/persona assets.
+     *
+     * Examples:
+     * - {{ia:randAll:scope=both|prefer=char}}
+     * - {{ia:randAll:scope=char|seed={{lastMessageId}}}}
+     */
+    async function resolveChatAssetRandomAll(param) {
+        const { main, opts } = parsePipeOptions(param);
+        // main is intentionally ignored; this macro is "no-prefix".
+        void main;
+
+        const scope = (opts.scope || 'both').toString().toLowerCase();
+        const prefer = (opts.prefer || 'char').toString().toLowerCase();
+        const mode = (opts.mode || 'abs').toString();
+        const fallback = (opts.fallback || '').toString();
+        const seed = (opts.seed || '').toString();
+
+        const now = Date.now();
+        const candidatesKey = `randAll::${scope}::${prefer}::${mode}`;
+        const cached = macroRandomCandidatesCache.get(candidatesKey);
+        if (cached && (now - cached.ts) < RANDOM_CANDIDATES_TTL_MS) {
+            const urls = cached.urls;
+            if (!urls || urls.length === 0) return fallback || '[InlineImageAssets] No assets available for randAll';
+            return urls[pickRandomIndex(urls.length, seed)];
+        }
+
+        try {
+            const context = getContext?.();
+            const character = context?.characters?.[context?.characterId];
+            if (!character) return fallback || '[InlineImageAssets] No character selected';
+
+            let charCache = new Map();
+            let personaCache = new Map();
+            const personaName = (typeof getCurrentPersonaName === 'function') ? getCurrentPersonaName() : null;
+
+            if ((scope === 'both' || scope === 'char') && typeof buildAssetCache === 'function') {
+                charCache = await buildAssetCache(character, context);
+            }
+            if ((scope === 'both' || scope === 'user' || scope === 'persona') && personaName && typeof buildPersonaAssetCache === 'function') {
+                personaCache = await buildPersonaAssetCache(personaName);
+            }
+
+            const urlsSet = new Set();
+            const tryCharFirst = (scope === 'char') || (scope === 'both' && prefer !== 'user');
+            if (tryCharFirst) {
+                for (const u of collectCandidateUrlsFromCache(charCache, { mode })) urlsSet.add(u);
+                for (const u of collectCandidateUrlsFromCache(personaCache, { mode })) urlsSet.add(u);
+            } else {
+                for (const u of collectCandidateUrlsFromCache(personaCache, { mode })) urlsSet.add(u);
+                for (const u of collectCandidateUrlsFromCache(charCache, { mode })) urlsSet.add(u);
+            }
+
+            const urls = Array.from(urlsSet);
+            macroRandomCandidatesCache.set(candidatesKey, { ts: now, urls });
+
+            if (urls.length === 0) return fallback || '[InlineImageAssets] No assets available for randAll';
+            return urls[pickRandomIndex(urls.length, seed)];
+        } catch (err) {
+            macroError('resolveChatAssetRandomAll failed', err);
+            return fallback || '[InlineImageAssets] Error resolving randAll asset';
+        }
+    }
+
+    async function resolveDesignImgTag(param) {
+        const { main, opts } = parsePipeOptions(param);
+        const scope = (opts.scope || 'both').toString().toLowerCase();
+        const cls = (opts.class || opts.cls || '').toString();
+        const alt = (opts.alt || '').toString();
+        const loading = (opts.loading || 'lazy').toString();
+        const decoding = (opts.decoding || '').toString();
+        const referrerpolicy = (opts.referrerpolicy || '').toString();
+        const fallback = (opts.fallback || '').toString();
+
+        const url = await resolveChatAssetUrl(main, { scope });
+        // If resolveChatAssetUrl returned an error string, respect fallback.
+        if (url && url.startsWith('[InlineImageAssets]')) {
+            return fallback || url;
+        }
+
+        const attrs = [];
+        attrs.push(`src="${escapeHtmlAttr(url)}"`);
+        if (alt) attrs.push(`alt="${escapeHtmlAttr(alt)}"`);
+        if (cls) attrs.push(`class="${escapeHtmlAttr(cls)}"`);
+        if (loading) attrs.push(`loading="${escapeHtmlAttr(loading)}"`);
+        if (decoding) attrs.push(`decoding="${escapeHtmlAttr(decoding)}"`);
+        if (referrerpolicy) attrs.push(`referrerpolicy="${escapeHtmlAttr(referrerpolicy)}"`);
+        attrs.push(`onerror="this.style.display='none'"`);
+        return `<img ${attrs.join(' ')}>`;
+    }
+
+    async function resolveDesignBgUrl(param) {
+        const { main, opts } = parsePipeOptions(param);
+        const scope = (opts.scope || 'both').toString().toLowerCase();
+        const fallback = (opts.fallback || '').toString();
+        const url = await resolveChatAssetUrl(main, { scope });
+        if (url && url.startsWith('[InlineImageAssets]')) return fallback || url;
+        // Quote with double-quotes to be safe in CSS.
+        return `url("${escapeHtmlAttr(url)}")`;
+    }
+
+    async function resolveDesignBgStyle(param) {
+        const { main, opts } = parsePipeOptions(param);
+        const scope = (opts.scope || 'both').toString().toLowerCase();
+        const fallback = (opts.fallback || '').toString();
+        const url = await resolveChatAssetUrl(main, { scope });
+        if (url && url.startsWith('[InlineImageAssets]')) return fallback || url;
+        return `background-image:url(\"${escapeHtmlAttr(url)}\");`;
+    }
+
+    async function resolveDesignCssLink(param) {
+        const { main, opts } = parsePipeOptions(param);
+        const media = (opts.media || '').toString();
+        const fallback = (opts.fallback || '').toString();
+        const href = await resolveAssetPath('css', `${main}${fallback ? `|fallback=${fallback}` : ''}`);
+        if (href && href.startsWith('[InlineImageAssets]')) return fallback || href;
+        const attrs = [`rel="stylesheet"`, `href="${escapeHtmlAttr(href)}"`];
+        if (media) attrs.push(`media="${escapeHtmlAttr(media)}"`);
+        return `<link ${attrs.join(' ')}>`;
+    }
+
+    async function resolveDesignJsModule(param) {
+        const { main, opts } = parsePipeOptions(param);
+        const defer = (opts.defer || '').toString();
+        const nomodule = (opts.nomodule || '').toString();
+        const fallback = (opts.fallback || '').toString();
+
+        const src = await resolveAssetPath('js', `${main}${fallback ? `|fallback=${fallback}` : ''}`);
+        if (src && src.startsWith('[InlineImageAssets]')) return fallback || src;
+
+        const attrs = [`type="module"`, `src="${escapeHtmlAttr(src)}"`];
+        if (defer && defer !== '0' && defer.toLowerCase() !== 'false') attrs.push('defer');
+        if (nomodule && nomodule !== '0' && nomodule.toLowerCase() !== 'false') attrs.push('nomodule');
+        return `<script ${attrs.join(' ')}></script>`;
+    }
+
+    /**
+     * Asynchronously resolves InlineImageAssets macros inside any string.
+     *
+     * Supported macros:
+     * - {{iaImagePath::path|mode=abs|fallback=...}}
+     * - {{iaCssPath::path|mode=abs|fallback=...}}
+     * - {{iaJsPath::path|mode=abs|fallback=...}}
+     * - {{iaHtmlPath::path|mode=abs|fallback=...}}
+     * - {{iaListFiles::dir|recursive=1|ext=png,jpg|format=json}}
+     *
+     * Example:
+     *   const html = await window.inlineImageAssetsMacros.resolve(
+     *     `<img src="{{iaImagePath::images/logo.png}}">`
+     *   );
+     */
+    async function resolveInlineImageAssetsMacros(text) {
+        const input = (text ?? '').toString();
+        // Match ST-style macros (primary): {{name::param}}
+        // Also support a "keyed" shorthand: {{name:param}} (used by JS-Slash-Runner-style keyed macros)
+        // We only handle a safe, whitelisted set of names.
+        const re = /\{\{\s*([a-zA-Z0-9_]+)\s*(::|:)\s*([^}]+?)\s*\}\}/g;
+
+        const matches = [];
+        let m;
+        while ((m = re.exec(input)) !== null) {
+            matches.push({ full: m[0], name: m[1], sep: m[2], param: m[3] });
+        }
+        if (matches.length === 0) return input;
+
+        // Resolve in parallel (async, non-blocking)
+        const resolved = await Promise.all(matches.map(async (x) => {
+            // Back-compat macros
+            switch (x.name) {
+                case 'iaImagePath': return resolveAssetPath('image', x.param);
+                case 'iaCssPath': return resolveAssetPath('css', x.param);
+                case 'iaJsPath': return resolveAssetPath('js', x.param);
+                case 'iaHtmlPath': return resolveAssetPath('html', x.param);
+                case 'iaListFiles': return resolveListFiles(x.param);
+            }
+
+            // Unified macro:
+            // - {{ia:img:assets/logo.png}}  (or {{ia::img:...}})
+            // - {{ia:css:style.css}}
+            // - {{ia:js:index.js}}
+            // - {{ia:html:templates/x.html}}
+            // - {{ia:list:templates|recursive=1|ext=png,jpg}}
+            // - {{ia:smile}} -> character/persona asset name (not path)
+            if (x.name === 'ia') {
+                const p = (x.param ?? '').toString().trim();
+                const firstColon = p.indexOf(':');
+                if (firstColon < 0) {
+                    // No key: treat as chat asset name shorthand
+                    return resolveChatAssetUrl(p, { scope: 'both' });
+                }
+                const key = p.slice(0, firstColon).trim().toLowerCase();
+                const rest = p.slice(firstColon + 1);
+                switch (key) {
+                    case 'img':
+                    case 'image': return resolveAssetPath('image', rest);
+                    case 'css': return resolveAssetPath('css', rest);
+                    case 'js': return resolveAssetPath('js', rest);
+                    case 'html': return resolveAssetPath('html', rest);
+                    case 'list': return resolveListFiles(rest);
+                    case 'asset': return resolveChatAssetUrl(rest, { scope: 'both' });
+                    case 'rand':
+                    case 'random': return resolveChatAssetRandom(rest);
+                    case 'randall':
+                    case 'randomall': return resolveChatAssetRandomAll(rest);
+                    case 'char': return resolveChatAssetUrl(rest, { scope: 'char' });
+                    case 'user':
+                    case 'persona': return resolveChatAssetUrl(rest, { scope: 'persona' });
+                    case 'imgtag': return resolveDesignImgTag(rest);
+                    case 'bgurl': return resolveDesignBgUrl(rest);
+                    case 'bgstyle': return resolveDesignBgStyle(rest);
+                    case 'csslink': return resolveDesignCssLink(rest);
+                    case 'jsmodule': return resolveDesignJsModule(rest);
+                    default:
+                        return x.full;
+                }
+            }
+
+            // Optional bare-key aliases (example requested: {{key:filename}}-style)
+            // Whitelist only, to avoid clobbering other macro systems.
+            // - {{img:assets/logo.png}} -> extension image path
+            // - {{css:style.css}} -> extension css path
+            // - {{js:index.js}} -> extension js path
+            // - {{html:templates/a.html}} -> extension html path
+            // - {{list:templates|...}} -> file list
+            // - {{char:smile}} -> character asset by name
+            // - {{user:smile}} -> persona asset by name
+            if (x.sep === ':') {
+                const key = x.name.toLowerCase();
+                switch (key) {
+                    case 'img':
+                    case 'image': return resolveAssetPath('image', x.param);
+                    case 'css': return resolveAssetPath('css', x.param);
+                    case 'js': return resolveAssetPath('js', x.param);
+                    case 'html': return resolveAssetPath('html', x.param);
+                    case 'list': return resolveListFiles(x.param);
+                    case 'asset': return resolveChatAssetUrl(x.param, { scope: 'both' });
+                    case 'rand':
+                    case 'random': return resolveChatAssetRandom(x.param);
+                    case 'randall':
+                    case 'randomall': return resolveChatAssetRandomAll(x.param);
+                    case 'char': return resolveChatAssetUrl(x.param, { scope: 'char' });
+                    case 'user':
+                    case 'persona': return resolveChatAssetUrl(x.param, { scope: 'persona' });
+                    case 'imgtag': return resolveDesignImgTag(x.param);
+                    case 'bgurl': return resolveDesignBgUrl(x.param);
+                    case 'bgstyle': return resolveDesignBgStyle(x.param);
+                    case 'csslink': return resolveDesignCssLink(x.param);
+                    case 'jsmodule': return resolveDesignJsModule(x.param);
+                    default: return x.full;
+                }
+            }
+
+            return x.full;
+        }));
+
+        let out = input;
+        for (let i = 0; i < matches.length; i++) {
+            out = out.replace(matches[i].full, resolved[i]);
+        }
+        return out;
+    }
+
+    // Expose a small public API for other scripts (e.g., JS-Slash-Runner) to call.
+    // If the extension is disabled, this file won't load, so macros won't resolve.
+    window.inlineImageAssetsMacros = {
+        version: '1.0.0',
+        resolve: resolveInlineImageAssetsMacros,
+        // JS-Slash-Runner / Tavern-Helper compatibility:
+        // - TavernHelper.substitudeMacros(...) expands its own macros (e.g., {{userAvatarPath}}).
+        // - Then we expand InlineImageAssets macros (e.g., {{iaImagePath::...}}).
+        resolveWithTavernHelper: async (text) => {
+            try {
+                const th = globalThis?.TavernHelper;
+                const pre = (th && typeof th.substitudeMacros === 'function')
+                    ? th.substitudeMacros((text ?? '').toString())
+                    : (text ?? '').toString();
+                return await resolveInlineImageAssetsMacros(pre);
+            } catch (err) {
+                macroError('resolveWithTavernHelper failed', err);
+                return await resolveInlineImageAssetsMacros((text ?? '').toString());
+            }
+        },
+        // direct helpers (optional)
+        resolveImagePath: (param) => resolveAssetPath('image', param),
+        resolveCssPath: (param) => resolveAssetPath('css', param),
+        resolveJsPath: (param) => resolveAssetPath('js', param),
+        resolveHtmlPath: (param) => resolveAssetPath('html', param),
+        listFiles: resolveListFiles,
+    };
+
+    macroLog('Macro API registered on window.inlineImageAssetsMacros');
+
     // Captures content between %%img: and %%
     const tagRegex = /%%img:([^%]+)%%/g;
 
@@ -2286,6 +3250,169 @@ import { eventSource, event_types } from "../../../../script.js";
 
     // Lightweight observer that only adds performance hints to new messages
     let performanceObserver = null;
+
+    // === MACRO AUTO-RESOLVE (for {{ia:...}} etc) ===
+    // Goal: Let users write macros directly in chat/regex HTML without having to call
+    // window.inlineImageAssetsMacros.resolve(...) manually.
+    let macroObserver = null;
+    let macroMutationBatch = [];
+    let macroMutationTimeout = null;
+    let macroRenderQueue = [];
+    let isMacroRenderScheduled = false;
+    const MACRO_RENDER_BATCH_SIZE = 4;
+
+    function hasInlineImageAssetsMacros(html) {
+        if (!html) return false;
+        // Keep this conservative: only our macro names to avoid stepping on other systems.
+        return /\{\{\s*(?:ia|iaImagePath|iaCssPath|iaJsPath|iaHtmlPath|iaListFiles)\s*(?:::|:)/.test(html);
+    }
+
+    function hashString32FNV1a(str) {
+        // Fast non-crypto hash for change detection.
+        let h = 2166136261;
+        for (let i = 0; i < str.length; i++) {
+            h ^= str.charCodeAt(i);
+            h = Math.imul(h, 16777619);
+        }
+        return (h >>> 0).toString(16);
+    }
+
+    function scheduleMacroRender() {
+        if (isMacroRenderScheduled) return;
+        isMacroRenderScheduled = true;
+
+        const ric = window.requestIdleCallback || ((cb) => setTimeout(() => cb({ timeRemaining: () => 0 }), 1));
+        ric(async (deadline) => {
+            try {
+                await processMacroRenderBatch(deadline);
+            } finally {
+                isMacroRenderScheduled = false;
+                if (macroRenderQueue.length > 0) {
+                    scheduleMacroRender();
+                }
+            }
+        }, { timeout: 100 });
+    }
+
+    function queueMessageForMacroResolve(messageElement) {
+        if (!messageElement || messageElement.nodeType !== Node.ELEMENT_NODE) return;
+        if (!messageElement.matches?.('.mes')) return;
+        if (!macroRenderQueue.includes(messageElement)) {
+            macroRenderQueue.push(messageElement);
+            scheduleMacroRender();
+        }
+    }
+
+    async function resolveMacrosInMessageElement(messageElement) {
+        if (!messageElement || messageElement.nodeType !== Node.ELEMENT_NODE) return;
+        const textElement = messageElement.querySelector?.('.mes_text');
+        if (!textElement) return;
+        if (textElement.dataset?.iiaMacroRendering === 'true') return;
+
+        const html = textElement.innerHTML || '';
+        if (!hasInlineImageAssetsMacros(html)) {
+            // Track hash anyway so we can detect future edits.
+            textElement.dataset.iiaMacroHash = hashString32FNV1a(html);
+            return;
+        }
+
+        const currentHash = hashString32FNV1a(html);
+        if (textElement.dataset.iiaMacroHash === currentHash) return;
+
+        const api = window.inlineImageAssetsMacros;
+        if (!api || typeof api.resolveWithTavernHelper !== 'function') {
+            // Should not happen when extension is loaded, but fail gracefully.
+            textElement.dataset.iiaMacroHash = currentHash;
+            return;
+        }
+
+        textElement.dataset.iiaMacroRendering = 'true';
+        try {
+            const resolved = await api.resolveWithTavernHelper(html);
+            if (typeof resolved === 'string' && resolved !== html) {
+                textElement.innerHTML = resolved;
+            }
+        } catch (err) {
+            macroError('Auto macro resolve failed', err);
+        } finally {
+            const finalHtml = textElement.innerHTML || '';
+            textElement.dataset.iiaMacroHash = hashString32FNV1a(finalHtml);
+            delete textElement.dataset.iiaMacroRendering;
+        }
+    }
+
+    async function processMacroRenderBatch(deadline) {
+        let processed = 0;
+        while (macroRenderQueue.length > 0 && processed < MACRO_RENDER_BATCH_SIZE) {
+            if (deadline && typeof deadline.timeRemaining === 'function' && deadline.timeRemaining() < 2) {
+                break;
+            }
+            const el = macroRenderQueue.shift();
+            if (el && el.isConnected) {
+                // eslint-disable-next-line no-await-in-loop
+                await resolveMacrosInMessageElement(el);
+                processed++;
+            }
+        }
+    }
+
+    function processMacroMutationBatch() {
+        const uniqueMessages = new Set();
+
+        for (const mutation of macroMutationBatch) {
+            // Added nodes: likely new messages
+            if (mutation.addedNodes && mutation.addedNodes.length > 0) {
+                for (const node of mutation.addedNodes) {
+                    if (node.nodeType === Node.ELEMENT_NODE) {
+                        if (node.matches?.('.mes')) {
+                            uniqueMessages.add(node);
+                        } else if (node.querySelectorAll) {
+                            node.querySelectorAll('.mes').forEach(m => uniqueMessages.add(m));
+                        }
+                    }
+                }
+            }
+
+            // Character data changes: streaming edits often mutate text nodes.
+            if (mutation.type === 'characterData' || mutation.type === 'childList') {
+                const targetEl = mutation.target?.nodeType === Node.ELEMENT_NODE
+                    ? mutation.target
+                    : mutation.target?.parentElement;
+                const mes = targetEl?.closest?.('.mes');
+                if (mes) uniqueMessages.add(mes);
+            }
+        }
+
+        macroMutationBatch = [];
+        for (const msg of uniqueMessages) {
+            queueMessageForMacroResolve(msg);
+        }
+    }
+
+    function setupMacroObserver() {
+        const chatElement = document.getElementById('chat');
+        if (!chatElement || macroObserver) return;
+
+        macroObserver = new MutationObserver((mutations) => {
+            macroMutationBatch.push(...mutations);
+            if (macroMutationTimeout) clearTimeout(macroMutationTimeout);
+            macroMutationTimeout = setTimeout(() => {
+                processMacroMutationBatch();
+                macroMutationTimeout = null;
+            }, 50);
+        });
+
+        // Observe subtree to catch streaming updates to message HTML.
+        macroObserver.observe(chatElement, {
+            childList: true,
+            subtree: true,
+            characterData: true,
+        });
+
+        // Initial pass for existing messages
+        chatElement.querySelectorAll('.mes').forEach(m => queueMessageForMacroResolve(m));
+        log('Macro auto-resolve observer setup complete');
+    }
     
     function setupPerformanceObserver() {
         const chatElement = document.getElementById('chat');
@@ -5641,6 +6768,9 @@ These are {{user}}'s (persona's) images - use them when describing {{user}}'s ex
         if(chatElement) {
             // ALWAYS initialize performance booster (for ALL characters)
             initializePerformanceBooster();
+
+            // ALWAYS enable macro auto-resolve (independent of asset rendering mode)
+            setupMacroObserver();
             
             // Check if current character has assets for asset rendering
             updateAssetRenderingState();
@@ -5676,6 +6806,16 @@ These are {{user}}'s (persona's) images - use them when describing {{user}}'s ex
             // Reset processed message tracking (WeakSet has no clear method)
             processedMessages = new WeakSet();
             noImageTagMessages = new WeakSet();
+
+            // Re-run macro resolve for the new chat
+            macroRenderQueue = [];
+            macroMutationBatch = [];
+            setTimeout(() => {
+                const chatEl = document.getElementById('chat');
+                if (chatEl) {
+                    chatEl.querySelectorAll('.mes').forEach(m => queueMessageForMacroResolve(m));
+                }
+            }, 150);
             
             // Reset asset visibility observer
             if (visibilityObserver) {
