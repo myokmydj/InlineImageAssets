@@ -4628,8 +4628,14 @@ import { eventSource, event_types } from "../../../../script.js";
             </div>
             <div class="inline-assets-toolbar">
                 <div class="inline-assets-toolbar-left">
-                    <i class="fa-solid fa-tags"></i>
-                    <div id="inline-assets-tag-filter-container"></div>
+                    <div class="inline-assets-search-wrapper">
+                        <i class="fa-solid fa-search"></i>
+                        <input type="text" id="inline-assets-search" class="text_pole" placeholder="Search assets..." autocomplete="off">
+                    </div>
+                    <div class="inline-assets-tag-section">
+                        <i class="fa-solid fa-tags"></i>
+                        <div id="inline-assets-tag-filter-container"></div>
+                    </div>
                 </div>
                 <div class="inline-assets-toolbar-right">
                     <div id="toggle-selection-btn" class="menu_button menu_button_icon" title="Toggle Selection Mode">
@@ -4903,7 +4909,26 @@ If there are variations in numbers, do not use them consecutively.`;
         // Use event delegation with addEventListener for better performance
         const tagFilterContainer = popupContainer.querySelector('#inline-assets-tag-filter-container');
         const gallery = popupContainer.querySelector('#inline-assets-gallery');
-        
+        const searchInput = popupContainer.querySelector('#inline-assets-search');
+
+        // Search input handler - debounced for performance
+        let searchDebounceTimer = null;
+        searchInput.addEventListener('input', (event) => {
+            clearTimeout(searchDebounceTimer);
+            searchDebounceTimer = setTimeout(async () => {
+                await initializeAssetList(popupContainer, character);
+            }, 200);
+        });
+
+        // Clear search on escape key
+        searchInput.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && searchInput.value) {
+                event.preventDefault();
+                searchInput.value = '';
+                initializeAssetList(popupContainer, character);
+            }
+        });
+
         // Tag filter click handler - immediate response
         tagFilterContainer.addEventListener('click', async (event) => {
             const tagFilter = event.target.closest('.tag-filter');
@@ -5670,7 +5695,9 @@ If there are variations in numbers, do not use them consecutively.`;
         }
         
         const activeFilterTags = new Set(Array.from(popupContainer.querySelectorAll('.tag-filter.active')).map(el => el.dataset.tag));
-        
+        const searchInput = popupContainer.querySelector('#inline-assets-search');
+        const searchQuery = searchInput ? searchInput.value.trim().toLowerCase() : '';
+
         updateTagFilters(popupContainer, assets);
 
         if (!assets || assets.length === 0) {
@@ -5680,19 +5707,35 @@ If there are variations in numbers, do not use them consecutively.`;
             return;
         }
 
-        // Filter - create a copy of the array to avoid reference issues
-        currentPopupAssets = activeFilterTags.size === 0
-            ? [...assets]
-            : assets.filter(asset => asset.tags && asset.tags.some(tag => activeFilterTags.has(tag)));
+        // Filter by tags and search query - create a copy of the array to avoid reference issues
+        currentPopupAssets = assets.filter(asset => {
+            // Tag filter: if no tags active, pass all; otherwise require at least one matching tag
+            const passesTagFilter = activeFilterTags.size === 0 ||
+                (asset.tags && asset.tags.some(tag => activeFilterTags.has(tag)));
+
+            // Search filter: if no search query, pass all; otherwise match asset name
+            const passesSearchFilter = !searchQuery ||
+                asset.name.toLowerCase().includes(searchQuery);
+
+            return passesTagFilter && passesSearchFilter;
+        });
 
         if (currentPopupAssets.length === 0) {
-             gallery.innerHTML = '<div class="inline-assets-placeholder"><p>No assets match the current tag filter.</p></div>';
-             loadMoreDiv.style.display = 'none';
-             statusSpan.textContent = `0 of ${assets.length} assets (filtered)`;
-             return;
+            const filterType = searchQuery && activeFilterTags.size > 0
+                ? 'search and tag filters'
+                : searchQuery
+                    ? 'search'
+                    : 'tag filter';
+            gallery.innerHTML = `<div class="inline-assets-placeholder"><p>No assets match the current ${filterType}.</p></div>`;
+            loadMoreDiv.style.display = 'none';
+            statusSpan.textContent = `0 of ${assets.length} assets (filtered)`;
+            return;
         }
 
-        statusSpan.textContent = `${currentPopupAssets.length} assets`;
+        const isFiltered = searchQuery || activeFilterTags.size > 0;
+        statusSpan.textContent = isFiltered
+            ? `${currentPopupAssets.length} of ${assets.length} assets (filtered)`
+            : `${currentPopupAssets.length} assets`;
 
         // Reset Gallery
         gallery.innerHTML = '';
@@ -5934,8 +5977,14 @@ If there are variations in numbers, do not use them consecutively.`;
             </div>
             <div class="inline-assets-toolbar">
                 <div class="inline-assets-toolbar-left">
-                    <i class="fa-solid fa-tags"></i>
-                    <div id="persona-inline-assets-tag-filter-container"></div>
+                    <div class="inline-assets-search-wrapper">
+                        <i class="fa-solid fa-search"></i>
+                        <input type="text" id="persona-inline-assets-search" class="text_pole" placeholder="Search assets..." autocomplete="off">
+                    </div>
+                    <div class="inline-assets-tag-section">
+                        <i class="fa-solid fa-tags"></i>
+                        <div id="persona-inline-assets-tag-filter-container"></div>
+                    </div>
                 </div>
                 <div class="inline-assets-toolbar-right">
                     <div id="persona-toggle-selection-btn" class="menu_button menu_button_icon" title="Toggle Selection Mode">
@@ -6124,7 +6173,26 @@ These are {{user}}'s (persona's) images - use them when describing {{user}}'s ex
     function setupPersonaPopupEventListeners(popupContainer, personaName) {
         const tagFilterContainer = popupContainer.querySelector('#persona-inline-assets-tag-filter-container');
         const gallery = popupContainer.querySelector('#persona-inline-assets-gallery');
-        
+        const searchInput = popupContainer.querySelector('#persona-inline-assets-search');
+
+        // Search input handler - debounced for performance
+        let searchDebounceTimer = null;
+        searchInput.addEventListener('input', (event) => {
+            clearTimeout(searchDebounceTimer);
+            searchDebounceTimer = setTimeout(async () => {
+                await initializePersonaAssetList(popupContainer, personaName);
+            }, 200);
+        });
+
+        // Clear search on escape key
+        searchInput.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && searchInput.value) {
+                event.preventDefault();
+                searchInput.value = '';
+                initializePersonaAssetList(popupContainer, personaName);
+            }
+        });
+
         // Tag filter click handler
         tagFilterContainer.addEventListener('click', async (event) => {
             const tagFilter = event.target.closest('.tag-filter');
@@ -6531,7 +6599,9 @@ These are {{user}}'s (persona's) images - use them when describing {{user}}'s ex
         
         const filterContainer = popupContainer.querySelector('#persona-inline-assets-tag-filter-container');
         const activeFilterTags = new Set(Array.from(filterContainer.querySelectorAll('.tag-filter.active')).map(el => el.dataset.tag));
-        
+        const searchInput = popupContainer.querySelector('#persona-inline-assets-search');
+        const searchQuery = searchInput ? searchInput.value.trim().toLowerCase() : '';
+
         // Update tag filters
         const allTags = new Set(assets.flatMap(asset => asset.tags || []));
         filterContainer.innerHTML = '';
@@ -6551,17 +6621,30 @@ These are {{user}}'s (persona's) images - use them when describing {{user}}'s ex
             return;
         }
 
-        currentPersonaPopupAssets = activeFilterTags.size === 0
-            ? [...assets]
-            : assets.filter(asset => asset.tags && asset.tags.some(tag => activeFilterTags.has(tag)));
+        // Filter by tags and search query
+        currentPersonaPopupAssets = assets.filter(asset => {
+            const passesTagFilter = activeFilterTags.size === 0 ||
+                (asset.tags && asset.tags.some(tag => activeFilterTags.has(tag)));
+            const passesSearchFilter = !searchQuery ||
+                asset.name.toLowerCase().includes(searchQuery);
+            return passesTagFilter && passesSearchFilter;
+        });
 
         if (currentPersonaPopupAssets.length === 0) {
-            gallery.innerHTML = '<div class="inline-assets-placeholder"><p>No assets match the current tag filter.</p></div>';
+            const filterType = searchQuery && activeFilterTags.size > 0
+                ? 'search and tag filters'
+                : searchQuery
+                    ? 'search'
+                    : 'tag filter';
+            gallery.innerHTML = `<div class="inline-assets-placeholder"><p>No assets match the current ${filterType}.</p></div>`;
             statusSpan.textContent = `0 of ${assets.length} assets (filtered)`;
             return;
         }
 
-        statusSpan.textContent = `${currentPersonaPopupAssets.length} assets`;
+        const isFiltered = searchQuery || activeFilterTags.size > 0;
+        statusSpan.textContent = isFiltered
+            ? `${currentPersonaPopupAssets.length} of ${assets.length} assets (filtered)`
+            : `${currentPersonaPopupAssets.length} assets`;
 
         gallery.innerHTML = '';
         
