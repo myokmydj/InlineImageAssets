@@ -1144,29 +1144,32 @@ import { eventSource, event_types } from "../../../../script.js";
     
     /**
      * Sanitizes a single path segment (filename or directory name)
-     * SillyTavern only accepts alphanumeric, '_', '-' characters (and '.' for extensions)
+     * Supports multilingual characters (Korean, Japanese, Chinese, etc.)
+     * Only removes dangerous filesystem characters
      * @param {string} segment - Original path segment
      * @returns {string} - Sanitized segment
      */
     function sanitizePathSegment(segment) {
-        // First, normalize unicode characters (e.g., ū -> u)
-        let sanitized = segment.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-        
-        // Replace any character that is not alphanumeric, underscore, hyphen, or dot with underscore
-        // Keep dots for file extensions
-        sanitized = sanitized.replace(/[^a-zA-Z0-9_\-\.]/g, '_');
-        
+        let sanitized = (segment || '').toString().trim();
+
+        // Replace whitespace with underscores
+        sanitized = sanitized.replace(/\s+/g, '_');
+
+        // Remove only dangerous/invalid filesystem characters
+        // Removed: / \ : * ? " < > | and control characters (0x00-0x1f)
+        sanitized = sanitized.replace(/[\/\\:*?"<>|\x00-\x1f]/g, '_');
+
         // Remove consecutive underscores
         sanitized = sanitized.replace(/_+/g, '_');
-        
+
         // Remove leading/trailing underscores (but keep leading dot for hidden files if needed)
         sanitized = sanitized.replace(/^_+|_+$/g, '');
-        
+
         // Ensure the segment is not empty
         if (!sanitized || sanitized === '.') {
             sanitized = 'unnamed';
         }
-        
+
         return sanitized.trim();
     }
 
@@ -1181,16 +1184,20 @@ import { eventSource, event_types } from "../../../../script.js";
 
     /**
      * Sanitizes a filename base (without extension) for SillyTavern /api/images/upload
-     * Keeps only [a-zA-Z0-9._-] and converts spaces to underscores.
+     * Supports multilingual characters (Korean, Japanese, Chinese, etc.)
+     * Only removes dangerous filesystem characters
      * @param {string} baseName
      * @returns {string}
      */
     function sanitizeImageBaseName(baseName) {
         let name = (baseName || '').toString().trim();
         name = name.replace(/\s+/g, '_');
-        name = name.replace(/[^a-zA-Z0-9._-]/g, '_');
+        name = name.replace(/[\/\\:*?"<>|\x00-\x1f]/g, '_');
+        name = name.replace(/\./g, '-');
+        name = name.replace(/_(\d+)$/, '-$1');
         name = name.replace(/_+/g, '_');
-        name = name.replace(/^_+|_+$/g, '');
+        name = name.replace(/-+/g, '-');
+        name = name.replace(/^[_-]+|[_-]+$/g, '');
         if (!name) name = 'unnamed';
         return name;
     }
@@ -1882,16 +1889,43 @@ import { eventSource, event_types } from "../../../../script.js";
                 throw new Error(`Upload failed: ${response.status} ${errorText}`);
             }
 
-            // Construct URL for user/images
-            const url = `/user/images/${characterName}/${fullFilename}`;
-            const path = `user/images/${characterName}/${fullFilename}`;
+            // Parse server response to get actual saved filename
+            // Server may modify filename (e.g., remove numbering like .1, _1)
+            let actualFilename = fullFilename;
+            let actualBaseName = baseName;
+            try {
+                const result = await response.json();
+                log('Server upload response:', result);
+                if (result && typeof result === 'object') {
+                    // Try various response formats from SillyTavern
+                    const serverPath = result.path || result.url || result.filename || result.name || '';
+                    if (serverPath) {
+                        const serverFilename = typeof serverPath === 'string' ? serverPath.split('/').pop() : '';
+                        if (serverFilename && serverFilename.includes('.')) {
+                            actualFilename = serverFilename;
+                            actualBaseName = serverFilename.substring(0, serverFilename.lastIndexOf('.'));
+                            if (actualFilename !== fullFilename) {
+                                log(`Server modified filename: "${fullFilename}" -> "${actualFilename}"`);
+                            }
+                        }
+                    }
+                }
+            } catch (e) {
+                // Response might not be JSON or empty, use constructed filename
+                log('Could not parse upload response, using constructed filename:', fullFilename);
+            }
+
+            // Construct URL for user/images using actual filename from server
+            const url = `/user/images/${characterName}/${actualFilename}`;
+            const path = `user/images/${characterName}/${actualFilename}`;
 
             return {
-                name: baseName,
-                filename: fullFilename,
+                name: actualBaseName,
+                filename: actualFilename,
                 path: path,
                 url: url,
-                isImageDir: true
+                isImageDir: true,
+                originalName: baseName // Keep track of what was requested vs what server saved
             };
         } catch (error) {
             console.error('[InlineImageAssets] Failed to save image:', error);
@@ -4582,12 +4616,13 @@ import { eventSource, event_types } from "../../../../script.js";
     }
 
     // --- Popup and Asset Management ---
-    
+
     // Globals for Popup Pagination
-    let currentPopupAssets = [];
+    let currentPopupAssets = [];     // Filtered assets for display
+    let currentMergedAssets = [];    // All merged assets (metadata + filesystem) for operations
     let currentPopupRenderCount = 0;
     const ASSETS_PER_PAGE = 50; // Render 50 at a time to prevent freeze
-    
+
     // Selection state for multi-select delete
     let selectedAssets = new Set();
     let isSelectionMode = false;
@@ -4703,6 +4738,7 @@ import { eventSource, event_types } from "../../../../script.js";
 
         // Refresh button
         container.querySelector('#refresh-assets-btn').addEventListener('click', async () => {
+            invalidateAssetCache(); // Clear cache to force fresh data from server
             await initializeAssetList(container, character);
             toastr.success('Assets refreshed');
         });
@@ -4821,38 +4857,40 @@ If there are variations in numbers, do not use them consecutively.`;
         // Delete selected button
         container.querySelector('#delete-selected-btn').addEventListener('click', async () => {
             if (selectedAssets.size === 0) return;
-            
+
             if (confirm(`Are you sure you want to delete ${selectedAssets.size} selected asset(s)?`)) {
-                const assets = ContextUtil.getAssetsRaw(character);
+                // Use currentMergedAssets which includes filesystem-discovered assets
+                const assets = currentMergedAssets;
                 const toDelete = Array.from(selectedAssets).sort((a, b) => b - a);
                 
                 // Delete files (only for non-legacy assets with filenames)
-                const filenames = toDelete
+                // Pass full asset objects to deleteMultipleImages for proper URL/path handling
+                const assetsToDelete = toDelete
                     .map(idx => assets[idx])
-                    .filter(asset => asset && asset.filename && !asset.isLegacy && !asset.data)
-                    .map(asset => asset.filename);
-                
-                if (filenames.length > 0) {
-                    const results = await deleteMultipleImages(character.name, filenames);
+                    .filter(asset => asset && asset.filename && !asset.isLegacy && !asset.data);
+
+                if (assetsToDelete.length > 0) {
+                    const results = await deleteMultipleImages(character.name, assetsToDelete);
                     if (results.failed > 0) {
                         toastr.warning(`${results.failed} file(s) failed to delete`);
                     }
                 }
-                
+
                 // Count legacy assets being deleted
                 const legacyCount = toDelete.filter(idx => {
                     const asset = assets[idx];
                     return asset && (asset.isLegacy || asset.data);
                 }).length;
-                
+
                 if (legacyCount > 0) {
                     log(`Removing ${legacyCount} legacy assets from metadata`);
                 }
-                
-                // Update metadata - remove all selected assets
+
+                // Update currentMergedAssets and metadata - remove all selected assets
                 const newAssets = assets.filter((_, idx) => !selectedAssets.has(idx));
+                currentMergedAssets = newAssets;
                 await ContextUtil.saveAssets(context.characterId, newAssets);
-                
+
                 // Also clear legacy assets field if we deleted legacy assets
                 if (legacyCount > 0) {
                     const remainingLegacy = newAssets.filter(a => a.isLegacy || a.data);
@@ -4860,10 +4898,11 @@ If there are variations in numbers, do not use them consecutively.`;
                         await ContextUtil.clearLegacyAssets(context.characterId);
                     }
                 }
-                
+
                 selectedAssets.clear();
                 isSelectionMode = false;
-                
+                invalidateAssetCache();
+
                 toastr.success(`Deleted ${toDelete.length} asset(s)`);
                 await initializeAssetList(container, character);
             }
@@ -4986,10 +5025,10 @@ If there are variations in numbers, do not use them consecutively.`;
             // Prevent event bubbling immediately
             event.stopPropagation();
             event.preventDefault();
-            
+
             const context = getContext();
-            // Optimization: operate on RAW array reference to avoid full copy
-            const assets = ContextUtil.getAssetsRaw(character);
+            // Use currentMergedAssets which includes filesystem-discovered assets
+            const assets = currentMergedAssets;
 
             if (previewImage) {
                 const index = parseInt(previewImage.dataset.index, 10);
@@ -5005,32 +5044,41 @@ If there are variations in numbers, do not use them consecutively.`;
             } else if (deleteButton) {
                 const index = parseInt(deleteButton.dataset.index, 10);
                 const asset = assets[index];
+                if (!asset) {
+                    log(`Asset at index ${index} not found`);
+                    return;
+                }
                 if (confirm(`Are you sure you want to delete the asset "${asset.name}"?`)) {
                     const isLegacy = asset.isLegacy || asset.data;
-                    
+
                     // Delete file if it exists (only for non-legacy assets)
                     if (asset.filename && !isLegacy) {
-                        const deleteSuccess = await deleteImageFile(character.name, asset.filename);
+                        const deleteSuccess = await deleteImageFile(character.name, asset);
                         if (!deleteSuccess) {
                             log(`File deletion failed for ${asset.filename}, but will remove from metadata`);
                         }
                     } else if (isLegacy) {
                         log(`Removing legacy asset "${asset.name}" from metadata (no file to delete)`);
                     }
-                    
-                    // Remove from assets array
-                    assets.splice(index, 1);
-                    await ContextUtil.saveAssets(context.characterId, assets);
-                    
+
+                    // Remove from currentMergedAssets
+                    currentMergedAssets.splice(index, 1);
+
+                    // Save updated assets to metadata
+                    await ContextUtil.saveAssets(context.characterId, currentMergedAssets);
+
                     // Clear legacy assets field if no more legacy assets remain
                     if (isLegacy) {
-                        const remainingLegacy = assets.filter(a => a.isLegacy || a.data);
+                        const remainingLegacy = currentMergedAssets.filter(a => a.isLegacy || a.data);
                         if (remainingLegacy.length === 0) {
                             await ContextUtil.clearLegacyAssets(context.characterId);
                         }
                     }
-                    
+
+                    // Invalidate cache and refresh UI
+                    invalidateAssetCache();
                     await initializeAssetList(popupContainer, character);
+                    toastr.success(`Asset "${asset.name}" deleted.`);
                 }
             } else if (deleteTagButton) {
                 const tagElement = target.closest('.inline-asset-tag');
@@ -5048,11 +5096,12 @@ If there are variations in numbers, do not use them consecutively.`;
         // Name change handler
         gallery.addEventListener('change', async (event) => {
             if (!event.target.classList.contains('inline-assets-item-name')) return;
-            
+
             const context = getContext();
-            const assets = ContextUtil.getAssetsRaw(character);
+            // Use currentMergedAssets which includes filesystem-discovered assets
+            const assets = currentMergedAssets;
             const index = parseInt(event.target.dataset.index, 10);
-            const originalName = assets[index].name;
+            const originalName = assets[index]?.name;
             const newName = event.target.value.trim();
 
             if (!newName) {
@@ -5073,13 +5122,15 @@ If there are variations in numbers, do not use them consecutively.`;
         // Tag input handler
         gallery.addEventListener('keydown', async (event) => {
             if (!event.target.classList.contains('inline-asset-tag-input') || event.key !== 'Enter') return;
-            
+
             event.preventDefault();
             const context = getContext();
             const newTag = event.target.value.trim().toLowerCase();
             if (newTag) {
-                const assets = ContextUtil.getAssetsRaw(character);
+                // Use currentMergedAssets which includes filesystem-discovered assets
+                const assets = currentMergedAssets;
                 const index = parseInt(event.target.dataset.index, 10);
+                if (!assets[index]) return;
                 if (!assets[index].tags) assets[index].tags = [];
                 if (!assets[index].tags.includes(newTag)) {
                     assets[index].tags.push(newTag);
@@ -5195,13 +5246,27 @@ If there are variations in numbers, do not use them consecutively.`;
             results.push(...batchResults);
         }
         
-        // Process results
+        // Process results - detect duplicates caused by server filename modification
         const newAssets = [];
+        const seenServerFilenames = new Map(); // actualFilename -> originalFileName
         let successfulUploads = 0;
         let failedUploads = 0;
-        
+        let duplicateUploads = 0;
+        const duplicateWarnings = [];
+
         for (const result of results) {
             if (result.success) {
+                const actualFilename = result.file.filename;
+
+                // Check if server returned same filename for different uploads
+                if (seenServerFilenames.has(actualFilename)) {
+                    duplicateUploads++;
+                    const originalFile = seenServerFilenames.get(actualFilename);
+                    duplicateWarnings.push(`"${result.file.originalName || actualFilename}" -> "${actualFilename}" (overwrote "${originalFile}")`);
+                    continue; // Skip duplicate
+                }
+
+                seenServerFilenames.set(actualFilename, result.file.originalName || result.file.name);
                 newAssets.push({
                     name: result.file.name,
                     filename: result.file.filename,
@@ -5222,7 +5287,12 @@ If there are variations in numbers, do not use them consecutively.`;
             await ContextUtil.saveAssets(context.characterId, updatedAssets);
             toastr.success(`Successfully uploaded ${successfulUploads} file(s).`);
         }
-        
+
+        if (duplicateUploads > 0) {
+            toastr.warning(`${duplicateUploads} file(s) were overwritten due to server filename normalization. Avoid using .N or _N numbering in filenames.`);
+            console.warn('[InlineImageAssets] Duplicate filenames after server normalization:', duplicateWarnings);
+        }
+
         if (failedUploads > 0) {
             toastr.error(`Failed to upload ${failedUploads} file(s).`);
         }
@@ -5607,7 +5677,35 @@ If there are variations in numbers, do not use them consecutively.`;
         // 3) user/images listing (highest priority URL)
         userImagesAssets.forEach((a) => upsertAsset(a, { isHighestPriorityUrl: true }));
 
-        assets = Array.from(assetMap.values());
+        // Build set of filenames that actually exist on filesystem
+        const existingFilenames = new Set();
+        fileAssets.forEach(a => {
+            if (a.filename) existingFilenames.add(a.filename);
+            if (a.name) existingFilenames.add(a.name);
+        });
+        userImagesAssets.forEach(a => {
+            if (a.filename) existingFilenames.add(a.filename);
+            if (a.name) existingFilenames.add(a.name);
+        });
+
+        // Filter out assets that don't exist on filesystem (unless they are legacy base64)
+        assets = Array.from(assetMap.values()).filter(a => {
+            // Keep legacy base64 assets
+            if (a.isLegacy || a.data) return true;
+            // Keep if filename or name exists in filesystem
+            if (a.filename && existingFilenames.has(a.filename)) return true;
+            if (a.name && existingFilenames.has(a.name)) return true;
+            // Check if any filesystem asset matches by canonical key
+            const key = getCanonicalAssetKey(a.name);
+            for (const fa of [...fileAssets, ...userImagesAssets]) {
+                if (getCanonicalAssetKey(fa.name) === key) return true;
+            }
+            log(`Filtering out non-existent asset: ${a.name} (filename: ${a.filename})`);
+            return false;
+        });
+
+        // Store merged assets globally for delete handler to use
+        currentMergedAssets = assets;
 
         // Auto-sync discovered file assets into metadata (and dedupe existing metadata by canonical key).
         // This prevents:
@@ -5684,11 +5782,31 @@ If there are variations in numbers, do not use them consecutively.`;
                 }
             }
 
+            // Remove metadata entries for files that no longer exist on filesystem
+            const keysToRemove = [];
+            for (const [key, meta] of byKey.entries()) {
+                // Skip legacy base64 assets
+                if (meta.isLegacy || meta.data) continue;
+                // Check if this asset exists in filesystem
+                const existsInFs = [...fileAssets, ...userImagesAssets].some(fa =>
+                    getCanonicalAssetKey(fa.name) === key ||
+                    (fa.filename && meta.filename && fa.filename === meta.filename)
+                );
+                if (!existsInFs) {
+                    log(`Removing stale metadata entry: ${meta.name} (key: ${key})`);
+                    keysToRemove.push(key);
+                    changed = true;
+                }
+            }
+            keysToRemove.forEach(k => byKey.delete(k));
+
             if (changed) {
                 const deduped = Array.from(byKey.values());
                 await ContextUtil.saveAssets(getContext().characterId, deduped);
                 invalidateAssetCache();
                 assets = deduped;
+                // Update currentMergedAssets after sync
+                currentMergedAssets = assets;
             }
         } catch (e) {
             log('Auto-sync/dedupe of discovered assets into metadata failed:', e.message);
@@ -5757,7 +5875,8 @@ If there are variations in numbers, do not use them consecutively.`;
     function renderGroupedAssets(popupContainer, character) {
         const gallery = popupContainer.querySelector('#inline-assets-gallery');
         const loadMoreDiv = popupContainer.querySelector('#inline-assets-load-more');
-        const rawAssets = ContextUtil.getAssetsRaw(character);
+        // Use currentMergedAssets instead of raw metadata (which may be empty for filesystem-only assets)
+        const rawAssets = currentMergedAssets;
         
         log('Rendering grouped assets, count:', currentPopupAssets.length);
         
@@ -6042,6 +6161,7 @@ If there are variations in numbers, do not use them consecutively.`;
 
         // Refresh button
         container.querySelector('#persona-refresh-assets-btn').addEventListener('click', async () => {
+            invalidateAssetCache(); // Clear cache to force fresh data from server
             await initializePersonaAssetList(container, personaName);
             toastr.success('Persona assets refreshed');
         });
